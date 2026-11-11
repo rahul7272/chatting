@@ -44,6 +44,16 @@ const NotificationSchema = new mongoose.Schema(
         default: 'ALL',
       },
     ],
+    targetUserIds: [
+      {
+        type: String,
+      },
+    ],
+    targetUserNames: [
+      {
+        type: String,
+      },
+    ],
     classId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Group',

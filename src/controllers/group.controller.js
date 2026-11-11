@@ -10,6 +10,7 @@ const statusCodes = require('../constants/statusCodes');
 const { ROLES } = require('../constants/roles');
 const { broadcast } = require('../config/socket');
 const socketEvents = require('../constants/socketEvents');
+const chatService = require('../services/chat.service');
 
 /**
  * Helper to populate teacher and students with all profile fields from Student and Teacher models
@@ -18,6 +19,11 @@ const populateGroup = (query) => {
   return query
     .populate({
       path: 'teacherId',
+      model: 'Teacher',
+      select: 'name email phoneNumber avatar avatarUrl qualification instruments',
+    })
+    .populate({
+      path: 'teacherIds',
       model: 'Teacher',
       select: 'name email phoneNumber avatar avatarUrl qualification instruments',
     })
@@ -90,6 +96,7 @@ const listGroups = async (req, res, next) => {
         const teacherDoc = await Teacher.findById(userId).lean();
         const teacherConditions = [
           { teacherId: userId },
+          { teacherIds: userId },
         ];
         if (teacherDoc && teacherDoc.name) {
           teacherConditions.push({
@@ -124,7 +131,7 @@ const listGroups = async (req, res, next) => {
     ]);
 
     const groupIds = groups.map((g) => g._id);
-    const currentUserId = req.user?.userId;
+    const currentUserId = req.query.userId || req.user?.userId;
 
     let unreadMap = {};
     let lastMessageMap = {};
@@ -170,8 +177,8 @@ const listGroups = async (req, res, next) => {
               $match: {
                 groupId: { $in: groupIdsAll },
                 senderId: { $nin: userObjIds },
-                readBy: { $nin: [currentUserIdStr, ...userObjIds] },
-                'seenBy.userId': { $ne: currentUserIdStr },
+                readBy: { $nin: userObjIds },
+                'seenBy.userId': { $nin: [currentUserIdStr] },
               },
             },
             {
@@ -279,9 +286,12 @@ const createGroup = async (req, res, next) => {
       return errorResponse(res, `Batch Code "${code}" is already in use. Please use a unique code.`, statusCodes.CONFLICT);
     }
 
+    const rawTeacherIds = Array.isArray(req.body.teacherIds) ? req.body.teacherIds : (teacherId ? [teacherId] : []);
+    const initialTeacherId = teacherId || (rawTeacherIds.length > 0 ? rawTeacherIds[0] : null);
+
     let resolvedTeacherName = teacherName;
-    if (teacherId) {
-      const teacherDoc = (await Teacher.findById(teacherId)) || (await User.findById(teacherId));
+    if (initialTeacherId) {
+      const teacherDoc = (await Teacher.findById(initialTeacherId)) || (await User.findById(initialTeacherId));
       if (teacherDoc) resolvedTeacherName = teacherDoc.name || resolvedTeacherName;
     }
 
@@ -297,7 +307,8 @@ const createGroup = async (req, res, next) => {
       profilePic: avatarUrl,
       status,
       isActive: status === 'Active',
-      teacherId: teacherId || null,
+      teacherId: initialTeacherId || null,
+      teacherIds: rawTeacherIds,
       teacherName: resolvedTeacherName,
       studentIds: studentIds || [],
       meetUrl: meetUrl || 'https://meet.google.com/new',
@@ -450,12 +461,12 @@ const updateGroup = async (req, res, next) => {
 };
 
 /**
- * Reassign or Assign Teacher with historical tracking
+ * Assign, Reassign or Multi-Allocate Teachers with historical tracking
  */
 const assignTeacher = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { teacherId, teacherName, reason = 'Faculty reallocation' } = req.body;
+    const { teacherId, teacherIds, teacherName, primaryTeacherId, reason = 'Faculty reallocation' } = req.body;
 
     const group = await Group.findById(id);
     if (!group) {
@@ -463,41 +474,66 @@ const assignTeacher = async (req, res, next) => {
     }
 
     const previousTeacherName = group.teacherName || 'None';
+    const oldTeacherIds = (group.teacherIds || []).map((t) => t.toString());
 
-    // Mark previous teacher history record with removedAt
-    if (group.teacherHistory && group.teacherHistory.length > 0) {
-      const lastHistory = group.teacherHistory[group.teacherHistory.length - 1];
-      if (!lastHistory.removedAt) {
-        lastHistory.removedAt = new Date();
-      }
+    // Check if client passed an array of teacherIds (Multi-Teacher mode)
+    let newTeacherIds = [];
+    if (Array.isArray(teacherIds)) {
+      newTeacherIds = teacherIds.filter((t) => mongoose.Types.ObjectId.isValid(t)).map((t) => t.toString());
+    } else if (teacherId && mongoose.Types.ObjectId.isValid(teacherId)) {
+      newTeacherIds = [teacherId.toString()];
     }
 
-    // Resolve new teacher
-    let resolvedName = teacherName;
-    if (teacherId) {
-      const teacherDoc = (await Teacher.findById(teacherId)) || (await User.findById(teacherId));
+    // Determine primary / lead faculty
+    let primaryId = primaryTeacherId || teacherId;
+    if (!primaryId && newTeacherIds.length > 0) {
+      primaryId = newTeacherIds[0];
+    }
+    if (primaryId && !newTeacherIds.includes(primaryId.toString())) {
+      newTeacherIds.unshift(primaryId.toString());
+    }
+
+    // Resolve primary teacher name
+    let resolvedName = teacherName || '';
+    if (primaryId) {
+      const teacherDoc = (await Teacher.findById(primaryId)) || (await User.findById(primaryId));
       if (teacherDoc) {
         resolvedName = teacherDoc.name || resolvedName;
       }
     }
 
-    group.teacherId = teacherId || null;
-    group.teacherName = resolvedName || '';
-
-    if (teacherId) {
-      group.teacherHistory.push({
-        teacherId,
-        teacherName: resolvedName,
-        assignedAt: new Date(),
-        assignedBy: req.user?.name || 'Admin',
-        reason,
-      });
+    // Mark previous teacher history record with removedAt if lead teacher changed
+    if (group.teacherId && group.teacherId.toString() !== (primaryId ? primaryId.toString() : '')) {
+      if (group.teacherHistory && group.teacherHistory.length > 0) {
+        const lastHistory = group.teacherHistory[group.teacherHistory.length - 1];
+        if (!lastHistory.removedAt) {
+          lastHistory.removedAt = new Date();
+        }
+      }
     }
+
+    // Add history for any newly assigned teachers
+    for (const tid of newTeacherIds) {
+      if (!oldTeacherIds.includes(tid)) {
+        const doc = (await Teacher.findById(tid)) || (await User.findById(tid));
+        group.teacherHistory.push({
+          teacherId: tid,
+          teacherName: doc?.name || 'Faculty Member',
+          assignedAt: new Date(),
+          assignedBy: req.user?.name || 'Admin',
+          reason,
+        });
+      }
+    }
+
+    group.teacherIds = newTeacherIds;
+    group.teacherId = primaryId || null;
+    group.teacherName = resolvedName || '';
 
     group.activityLogs.unshift({
       action: 'Teacher Reassigned',
       actorName: req.user?.name || 'Admin',
-      details: `Teacher changed from "${previousTeacherName}" to "${resolvedName || 'Unassigned'}". Reason: ${reason}`,
+      details: `Faculty roster updated: ${newTeacherIds.length} instructors. Lead: "${resolvedName || 'Unassigned'}". Reason: ${reason}`,
       timestamp: new Date(),
     });
 
@@ -507,11 +543,176 @@ const assignTeacher = async (req, res, next) => {
 
     try {
       broadcast(socketEvents.GROUP_UPDATED, populated, id);
+      if (resolvedName) {
+        chatService.sendSystemMessage(id, `🎓 Faculty allocation updated: ${resolvedName} (${reason || 'Faculty Mentor'})`, {
+          action: 'TEACHER_ASSIGNED',
+          teacherId: primaryId,
+          teacherIds: newTeacherIds,
+          teacherName: resolvedName,
+        });
+      }
     } catch (e) {
       console.warn('[Broadcast Error in assignTeacher]:', e.message);
     }
 
-    return successResponse(res, { group: populated }, `Teacher reassigned to ${resolvedName || 'Unassigned'}.`);
+    return successResponse(
+      res,
+      { group: populated },
+      `Faculty allocated successfully (${newTeacherIds.length} teacher${newTeacherIds.length > 1 ? 's' : ''}). Lead: ${resolvedName || 'Unassigned'}.`
+    );
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Add one or more Teachers to Group faculty roster
+ */
+const addTeachers = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { teacherIds = [], reason = 'Additional Faculty Mentor Allocation' } = req.body;
+
+    const group = await Group.findById(id);
+    if (!group) {
+      return errorResponse(res, 'Group not found.', statusCodes.NOT_FOUND);
+    }
+
+    const existingIds = (group.teacherIds || []).map((t) => t.toString());
+    const validNewIds = teacherIds
+      .filter((tid) => mongoose.Types.ObjectId.isValid(tid))
+      .map((tid) => tid.toString())
+      .filter((tid) => !existingIds.includes(tid));
+
+    if (validNewIds.length === 0) {
+      const populated = await populateGroup(Group.findById(id));
+      return successResponse(res, { group: populated }, 'Selected faculty members are already assigned to this batch.');
+    }
+
+    const updatedTeacherIds = [...existingIds, ...validNewIds];
+    group.teacherIds = updatedTeacherIds;
+
+    // If no lead teacher was set, set first added teacher as lead
+    if (!group.teacherId && updatedTeacherIds.length > 0) {
+      group.teacherId = updatedTeacherIds[0];
+      const leadDoc = (await Teacher.findById(group.teacherId)) || (await User.findById(group.teacherId));
+      group.teacherName = leadDoc?.name || '';
+    }
+
+    // Add history entries
+    for (const tid of validNewIds) {
+      const doc = (await Teacher.findById(tid)) || (await User.findById(tid));
+      group.teacherHistory.push({
+        teacherId: tid,
+        teacherName: doc?.name || 'Faculty Member',
+        assignedAt: new Date(),
+        assignedBy: req.user?.name || 'Admin',
+        reason,
+      });
+    }
+
+    group.activityLogs.unshift({
+      action: 'Faculty Added',
+      actorName: req.user?.name || 'Admin',
+      details: `${validNewIds.length} faculty member(s) added to batch.`,
+      timestamp: new Date(),
+    });
+
+    await group.save();
+
+    const populated = await populateGroup(Group.findById(id));
+
+    try {
+      broadcast(socketEvents.GROUP_UPDATED, populated, id);
+      chatService.sendSystemMessage(id, `🎓 ${validNewIds.length} new instructor(s) added to this batch roster.`, {
+        action: 'TEACHERS_ADDED',
+        count: validNewIds.length,
+      });
+    } catch (e) {
+      console.warn('[Broadcast Error in addTeachers]:', e.message);
+    }
+
+    return successResponse(res, { group: populated }, `${validNewIds.length} faculty member(s) assigned successfully.`);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Remove a specific Teacher from Group faculty roster
+ */
+const removeTeacher = async (req, res, next) => {
+  try {
+    const { id, teacherId } = req.params;
+
+    const group = await Group.findById(id);
+    if (!group) {
+      return errorResponse(res, 'Group not found.', statusCodes.NOT_FOUND);
+    }
+
+    const existingIds = (group.teacherIds || []).map((t) => t.toString());
+    const targetIdStr = teacherId.toString();
+
+    if (!existingIds.includes(targetIdStr) && group.teacherId?.toString() !== targetIdStr) {
+      return errorResponse(res, 'Teacher is not assigned to this batch.', statusCodes.BAD_REQUEST);
+    }
+
+    // Remove from teacherIds
+    const remainingIds = existingIds.filter((tid) => tid !== targetIdStr);
+    group.teacherIds = remainingIds;
+
+    // Resolve name of removed teacher
+    const removedDoc = (await Teacher.findById(teacherId)) || (await User.findById(teacherId));
+    const removedName = removedDoc?.name || 'Faculty Member';
+
+    // If removed teacher was the primary lead, promote next available or clear
+    let leadChanged = false;
+    if (group.teacherId && group.teacherId.toString() === targetIdStr) {
+      leadChanged = true;
+      if (remainingIds.length > 0) {
+        group.teacherId = remainingIds[0];
+        const nextLeadDoc = (await Teacher.findById(remainingIds[0])) || (await User.findById(remainingIds[0]));
+        group.teacherName = nextLeadDoc?.name || '';
+      } else {
+        group.teacherId = null;
+        group.teacherName = '';
+      }
+    }
+
+    // Update history record
+    if (group.teacherHistory && group.teacherHistory.length > 0) {
+      const matchHistory = group.teacherHistory
+        .slice()
+        .reverse()
+        .find((h) => h.teacherId?.toString() === targetIdStr && !h.removedAt);
+      if (matchHistory) {
+        matchHistory.removedAt = new Date();
+      }
+    }
+
+    group.activityLogs.unshift({
+      action: 'Faculty Removed',
+      actorName: req.user?.name || 'Admin',
+      details: `Teacher "${removedName}" removed from cohort. ${leadChanged ? `New lead: "${group.teacherName || 'None'}"` : ''}`,
+      timestamp: new Date(),
+    });
+
+    await group.save();
+
+    const populated = await populateGroup(Group.findById(id));
+
+    try {
+      broadcast(socketEvents.GROUP_UPDATED, populated, id);
+      chatService.sendSystemMessage(id, `ℹ️ Instructor ${removedName} has been unassigned from this batch.`, {
+        action: 'TEACHER_REMOVED',
+        teacherId,
+        teacherName: removedName,
+      });
+    } catch (e) {
+      console.warn('[Broadcast Error in removeTeacher]:', e.message);
+    }
+
+    return successResponse(res, { group: populated }, `Faculty member "${removedName}" unassigned successfully.`);
   } catch (err) {
     next(err);
   }
@@ -553,6 +754,10 @@ const addStudents = async (req, res, next) => {
 
     try {
       broadcast(socketEvents.MEMBERS_UPDATED, populated, id);
+      chatService.sendSystemMessage(id, `👥 ${newIds.length} new student${newIds.length > 1 ? 's' : ''} joined the batch.`, {
+        action: 'STUDENTS_ADDED',
+        count: newIds.length,
+      });
     } catch (e) {
       console.warn('[Broadcast Error in addStudents]:', e.message);
     }
@@ -638,6 +843,11 @@ const addRecording = async (req, res, next) => {
 
     try {
       broadcast(socketEvents.RECORDINGS_UPDATED, { recordings: group.recordings }, id);
+      chatService.sendSystemMessage(id, `🎥 New class recording uploaded: "${title.trim()}"`, {
+        action: 'RECORDING_ADDED',
+        title: title.trim(),
+        url: url.trim(),
+      });
     } catch (e) {
       console.warn('[Broadcast Error in addRecording]:', e.message);
     }
@@ -805,7 +1015,7 @@ const logRecordingWatch = async (req, res, next) => {
 const addResource = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { title, type = 'note', fileUrl, description, dueDate } = req.body;
+    const { title, type = 'note', fileUrl, description, dueDate, targetDate } = req.body;
 
     if (!title) {
       return errorResponse(res, 'Resource title is required.', statusCodes.BAD_REQUEST);
@@ -816,12 +1026,30 @@ const addResource = async (req, res, next) => {
       return errorResponse(res, 'Group not found.', statusCodes.NOT_FOUND);
     }
 
+    const resolvedDate = targetDate || dueDate || '';
+
+    // Auto-detect extension from fileUrl if available
+    let resolvedType = type || 'note';
+    if (fileUrl) {
+      const cleanUrl = fileUrl.toLowerCase().trim().split('?')[0].split('#')[0];
+      if (cleanUrl.endsWith('.xlsx') || cleanUrl.endsWith('.xls') || cleanUrl.endsWith('.csv') || cleanUrl.endsWith('.ods')) {
+        resolvedType = 'excel';
+      } else if (cleanUrl.endsWith('.pdf')) {
+        resolvedType = 'pdf';
+      } else if (cleanUrl.endsWith('.mp3') || cleanUrl.endsWith('.wav') || cleanUrl.endsWith('.m4a') || cleanUrl.endsWith('.aac') || cleanUrl.endsWith('.ogg')) {
+        resolvedType = 'audio';
+      } else if (cleanUrl.endsWith('.doc') || cleanUrl.endsWith('.docx') || cleanUrl.endsWith('.txt') || cleanUrl.endsWith('.rtf') || cleanUrl.endsWith('.ppt') || cleanUrl.endsWith('.pptx')) {
+        resolvedType = 'document';
+      }
+    }
+
     group.resources.unshift({
       title: title.trim(),
-      type,
+      type: resolvedType,
       fileUrl: fileUrl ? fileUrl.trim() : '',
       description: description ? description.trim() : '',
-      dueDate: dueDate || '',
+      dueDate: resolvedDate,
+      targetDate: resolvedDate,
       isPublished: true,
       addedBy: req.user?.name || 'Admin',
       createdAt: new Date(),
@@ -838,6 +1066,11 @@ const addResource = async (req, res, next) => {
 
     try {
       broadcast(socketEvents.RESOURCES_UPDATED, { resources: group.resources }, id);
+      chatService.sendSystemMessage(id, `📄 New ${type || 'resource'} uploaded: "${title.trim()}"`, {
+        action: 'RESOURCE_ADDED',
+        title: title.trim(),
+        fileUrl: fileUrl ? fileUrl.trim() : '',
+      });
     } catch (e) {
       console.warn('[Broadcast Error in addResource]:', e.message);
     }
@@ -870,6 +1103,64 @@ const deleteResource = async (req, res, next) => {
     }
 
     return successResponse(res, { resources: group.resources }, 'Resource removed successfully.');
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Update a note / assignment resource
+ */
+const updateResource = async (req, res, next) => {
+  try {
+    const { id, resourceId } = req.params;
+    const { title, type, fileUrl, description, dueDate, targetDate, isPublished } = req.body;
+
+    const group = await Group.findById(id);
+    if (!group) {
+      return errorResponse(res, 'Group not found.', statusCodes.NOT_FOUND);
+    }
+
+    const resource = group.resources.id(resourceId);
+    if (!resource) {
+      return errorResponse(res, 'Resource not found.', statusCodes.NOT_FOUND);
+    }
+
+    if (title !== undefined) resource.title = title.trim();
+    if (fileUrl !== undefined) {
+      resource.fileUrl = fileUrl.trim();
+      // Auto-detect extension if type is generic or missing
+      if (!type || type === 'note' || type === 'document') {
+        const cleanUrl = fileUrl.toLowerCase().trim().split('?')[0].split('#')[0];
+        if (cleanUrl.endsWith('.xlsx') || cleanUrl.endsWith('.xls') || cleanUrl.endsWith('.csv') || cleanUrl.endsWith('.ods')) {
+          resource.type = 'excel';
+        } else if (cleanUrl.endsWith('.pdf')) {
+          resource.type = 'pdf';
+        } else if (cleanUrl.endsWith('.mp3') || cleanUrl.endsWith('.wav') || cleanUrl.endsWith('.m4a') || cleanUrl.endsWith('.aac')) {
+          resource.type = 'audio';
+        } else if (cleanUrl.endsWith('.doc') || cleanUrl.endsWith('.docx') || cleanUrl.endsWith('.txt')) {
+          resource.type = 'document';
+        }
+      }
+    }
+    if (type !== undefined) resource.type = type;
+    if (description !== undefined) resource.description = description.trim();
+    const resolvedDate = targetDate !== undefined ? targetDate : dueDate;
+    if (resolvedDate !== undefined) {
+      resource.dueDate = resolvedDate;
+      resource.targetDate = resolvedDate;
+    }
+    if (isPublished !== undefined) resource.isPublished = Boolean(isPublished);
+
+    await group.save();
+
+    try {
+      broadcast(socketEvents.RESOURCES_UPDATED, { resources: group.resources }, id);
+    } catch (e) {
+      console.warn('[Broadcast Error in updateResource]:', e.message);
+    }
+
+    return successResponse(res, { resources: group.resources }, 'Resource updated successfully.');
   } catch (err) {
     next(err);
   }
@@ -911,6 +1202,11 @@ const sendAnnouncement = async (req, res, next) => {
 
     try {
       broadcast(socketEvents.GROUP_UPDATED, group, id);
+      chatService.sendSystemMessage(id, `📢 Announcement: ${title.trim()}\n${message.trim()}`, {
+        action: 'ANNOUNCEMENT',
+        title: title.trim(),
+        target,
+      });
     } catch (e) {
       console.warn('[Broadcast Error in sendAnnouncement]:', e.message);
     }
@@ -1011,16 +1307,23 @@ const getGroupSchedules = async (req, res, next) => {
       search,
     } = req.query;
 
-    const targetDate = date ? new Date(date) : new Date();
-    const dateOnlyStr = isNaN(targetDate.getTime())
-      ? new Date().toISOString().split('T')[0]
-      : targetDate.toISOString().split('T')[0];
-
-    const dayIndex = isNaN(targetDate.getTime()) ? new Date().getDay() : targetDate.getDay();
     const dayNamesList = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-    const currentDayName = dayNamesList[dayIndex];
+    let dayIndex;
+    let currentDayName;
+    let dateOnlyStr;
 
-    const normalizedClassDate = new Date(`${dateOnlyStr}T00:00:00.000Z`);
+    if (date && date !== 'ALL' && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      const [y, m, d] = date.split('-').map(Number);
+      const localDt = new Date(y, m - 1, d);
+      dayIndex = localDt.getDay();
+      currentDayName = dayNamesList[dayIndex];
+      dateOnlyStr = date;
+    } else {
+      const now = new Date();
+      dayIndex = now.getDay();
+      currentDayName = dayNamesList[dayIndex];
+      dateOnlyStr = date === 'ALL' ? 'ALL' : now.toISOString().split('T')[0];
+    }
 
     const query = {
       $or: [{ status: 'Active' }, { isActive: true }],
@@ -1049,25 +1352,37 @@ const getGroupSchedules = async (req, res, next) => {
       .populate({
         path: 'teacherId',
         model: 'Teacher',
-        select: 'name email phoneNumber avatar avatarUrl qualification instruments',
+        select: 'name email phoneNumber avatar avatarUrl qualification instruments teacherId',
+      })
+      .populate({
+        path: 'teacherIds',
+        model: 'Teacher',
+        select: 'name email phoneNumber avatar avatarUrl qualification instruments teacherId',
       })
       .populate({
         path: 'studentIds',
         model: 'Student',
-        select: 'name avatar avatarUrl status',
+        select: 'name avatar avatarUrl status phoneNumber email enrollmentNo instruments studentLevel',
       })
       .lean();
 
     const groupIds = groups.map((g) => g._id);
     const Attendance = require('../models/Attendance');
-    const attendanceRecords = await Attendance.find({
-      groupId: { $in: groupIds },
-      classDate: normalizedClassDate,
-    }).lean();
+
+    const attendanceQuery = { groupId: { $in: groupIds } };
+    if (dateOnlyStr !== 'ALL') {
+      const startOfDay = new Date(`${dateOnlyStr}T00:00:00.000Z`);
+      const endOfDay = new Date(`${dateOnlyStr}T23:59:59.999Z`);
+      attendanceQuery.classDate = { $gte: startOfDay, $lte: endOfDay };
+    }
+
+    const attendanceRecords = await Attendance.find(attendanceQuery).lean();
 
     const attendanceByGroup = {};
+    const attendanceStudentMap = {};
     attendanceRecords.forEach((att) => {
-      const gId = att.groupId.toString();
+      const gId = att.groupId ? att.groupId.toString() : '';
+      const sId = att.studentId ? att.studentId.toString() : '';
       if (!attendanceByGroup[gId]) {
         attendanceByGroup[gId] = { present: 0, absent: 0, excused: 0, total: 0 };
       }
@@ -1075,6 +1390,10 @@ const getGroupSchedules = async (req, res, next) => {
       if (att.status === 'PRESENT') attendanceByGroup[gId].present += 1;
       else if (att.status === 'ABSENT') attendanceByGroup[gId].absent += 1;
       else if (att.status === 'EXCUSED') attendanceByGroup[gId].excused += 1;
+
+      if (gId && sId) {
+        attendanceStudentMap[`${gId}_${sId}`] = att.status;
+      }
     });
 
     const parseTimeToMinutes = (tStr) => {
@@ -1090,7 +1409,8 @@ const getGroupSchedules = async (req, res, next) => {
     };
 
     const now = new Date();
-    const isToday = now.toISOString().split('T')[0] === dateOnlyStr;
+    const todayYMD = now.toISOString().split('T')[0];
+    const isToday = dateOnlyStr === todayYMD;
     const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
     const schedules = [];
@@ -1114,9 +1434,18 @@ const getGroupSchedules = async (req, res, next) => {
       const startMinutes = parseTimeToMinutes(startTime);
       const endMinutes = parseTimeToMinutes(endTime);
 
+      let durationMinutes = endMinutes >= startMinutes ? endMinutes - startMinutes : (1440 - startMinutes + endMinutes);
+      if (durationMinutes === 0) durationMinutes = 60;
+      const durHours = Math.floor(durationMinutes / 60);
+      const durMins = durationMinutes % 60;
+      const durationFormatted = durHours > 0 ? (durMins > 0 ? `${durHours}h ${durMins}m` : `${durHours}h`) : `${durMins}m`;
+
+      const timePeriod = startMinutes < 12 * 60 ? 'MORNING' : (startMinutes < 17 * 60 ? 'AFTERNOON' : 'EVENING');
+
       let sessionStatus = 'UPCOMING';
-      if (!isToday) {
-        if (targetDate < now) {
+      if (!isToday && dateOnlyStr !== 'ALL') {
+        const targetDateObj = new Date(dateOnlyStr);
+        if (targetDateObj < new Date(todayYMD)) {
           sessionStatus = 'COMPLETED';
         } else {
           sessionStatus = 'UPCOMING';
@@ -1138,6 +1467,33 @@ const getGroupSchedules = async (req, res, next) => {
       const attStats = attendanceByGroup[group._id.toString()];
       const teacherObj = group.teacherId || {};
 
+      // Map complete enrolled student roster with attendance indicators
+      const students = (group.studentIds || []).map((st) => {
+        const sId = st._id ? st._id.toString() : '';
+        const attStatus = attendanceStudentMap[`${group._id}_${sId}`] || 'PENDING';
+        return {
+          _id: st._id,
+          name: st.name || 'Student',
+          enrollmentNo: st.enrollmentNo || '',
+          email: st.email || '',
+          phoneNumber: st.phoneNumber || '',
+          avatar: st.avatar || st.avatarUrl || '',
+          status: st.status || 'Active',
+          studentLevel: st.studentLevel || group.level,
+          attendanceStatus: attStatus,
+        };
+      });
+
+      // Co-teachers
+      const coTeachers = (group.teacherIds || [])
+        .filter((t) => t && t._id && (!teacherObj._id || t._id.toString() !== teacherObj._id.toString()))
+        .map((t) => ({
+          _id: t._id,
+          name: t.name,
+          avatar: t.avatar || t.avatarUrl || '',
+          qualification: t.qualification || '',
+        }));
+
       schedules.push({
         _id: group._id,
         batchId: group._id,
@@ -1145,16 +1501,20 @@ const getGroupSchedules = async (req, res, next) => {
         batchCode: group.code,
         subject: group.subject,
         level: group.level,
+        description: group.description || '',
         startTime,
         endTime,
         timeDisplay: `${startTime} - ${endTime}`,
         startMinutes,
         endMinutes,
+        durationMinutes,
+        durationFormatted,
+        timePeriod,
         dayNames: dayNames.length > 0 ? dayNames : [currentDayName],
         meetUrl: group.meetUrl || 'https://meet.google.com/new',
         teacher: {
           _id: teacherObj._id || null,
-          teacherId: teacherObj._id ? `TCH-${teacherObj._id.toString().slice(-4).toUpperCase()}` : 'TCH-104',
+          teacherId: teacherObj.teacherId || (teacherObj._id ? `TCH-${teacherObj._id.toString().slice(-4).toUpperCase()}` : 'TCH-104'),
           name: teacherObj.name || group.teacherName || 'Unassigned Faculty',
           email: teacherObj.email || '',
           phoneNumber: teacherObj.phoneNumber || '',
@@ -1162,7 +1522,9 @@ const getGroupSchedules = async (req, res, next) => {
           qualification: teacherObj.qualification || '',
           instruments: teacherObj.instruments || [group.subject],
         },
-        studentCount: group.studentIds ? group.studentIds.length : 0,
+        coTeachers,
+        students,
+        studentCount: students.length,
         sessionStatus,
         attendanceLogged: Boolean(attStats && attStats.total > 0),
         attendanceSummary: attStats || { present: 0, absent: 0, excused: 0, total: 0 },
@@ -1234,12 +1596,15 @@ module.exports = {
   getGroupById,
   updateGroup,
   assignTeacher,
+  addTeachers,
+  removeTeacher,
   addStudents,
   removeStudent,
   addRecording,
   deleteRecording,
   logRecordingWatch,
   addResource,
+  updateResource,
   deleteResource,
   sendAnnouncement,
   deleteOrArchiveGroup,

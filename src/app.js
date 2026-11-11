@@ -30,8 +30,21 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Serve static uploads (covers /uploads/audio/..., /uploads/images/..., etc.)
-app.use('/uploads', express.static(uploadsDir));
+// Serve static uploads (covers /uploads/audio/..., /uploads/images/..., /uploads/documents/...)
+app.use(
+  '/uploads',
+  express.static(uploadsDir, {
+    setHeaders: (res, filePath) => {
+      const lower = filePath.toLowerCase();
+      if (lower.endsWith('.pdf')) {
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'inline');
+      }
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Type');
+    },
+  })
+);
 
 // Fallback resolver: if legacy requests omit the subfolder, search across subfolders
 app.use('/uploads/:fileName', (req, res, next) => {
@@ -39,6 +52,12 @@ app.use('/uploads/:fileName', (req, res, next) => {
   for (const dir of uploadSubdirs) {
     const candidate = path.join(uploadsDir, dir, fileName);
     if (fs.existsSync(candidate)) {
+      if (candidate.toLowerCase().endsWith('.pdf')) {
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'inline');
+      }
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Type');
       return res.sendFile(candidate);
     }
   }

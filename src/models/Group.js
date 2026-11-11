@@ -45,12 +45,14 @@ const ResourceSchema = new mongoose.Schema(
     title: { type: String, required: true },
     type: {
       type: String,
-      enum: ['note', 'assignment', 'pdf', 'document', 'audio', 'link'],
       default: 'note',
+      trim: true,
+      lowercase: true,
     },
     fileUrl: { type: String, default: '' },
     description: { type: String, default: '' },
     dueDate: { type: String, default: '' },
+    targetDate: { type: String, default: '' },
     isPublished: { type: Boolean, default: true },
     addedBy: { type: String, default: 'Instructor / Admin' },
     createdAt: { type: Date, default: Date.now },
@@ -140,7 +142,7 @@ const GroupSchema = new mongoose.Schema(
       default: true,
       index: true,
     },
-    // Assigned Primary Faculty / Teacher
+    // Assigned Primary Lead Faculty / Teacher
     teacherId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Teacher',
@@ -151,6 +153,13 @@ const GroupSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    // Multiple Assigned Faculty Instructors (Lead + Co-Teachers)
+    teacherIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Teacher',
+      },
+    ],
     // Historical Teacher Reassignment Logs
     teacherHistory: [TeacherHistorySchema],
     // Enrolled Students
@@ -174,6 +183,13 @@ const GroupSchema = new mongoose.Schema(
       endTime: { type: String, default: '06:00 PM' },
       timezone: { type: String, default: 'Asia/Kolkata' },
       notes: { type: String, default: '' },
+    },
+    // Custom Editable Class Alert Messages (T-15m & T-5m)
+    alertTemplates: {
+      t15Title: { type: String, default: '', trim: true },
+      t15Message: { type: String, default: '', trim: true },
+      t5Title: { type: String, default: '', trim: true },
+      t5Message: { type: String, default: '', trim: true },
     },
     // Group Communication & Feature Permissions
     chatSettings: {
@@ -211,13 +227,27 @@ const GroupSchema = new mongoose.Schema(
   }
 );
 
-// Ensure status and isActive stay synchronized
+// Ensure status and isActive stay synchronized, and teacherId / teacherIds remain synchronized
 GroupSchema.pre('save', function (next) {
   if (this.status === 'Inactive' || this.status === 'Archived') {
     this.isActive = false;
   } else if (this.status === 'Active') {
     this.isActive = true;
   }
+
+  // Synchronize teacherId and teacherIds
+  if (this.teacherId) {
+    if (!Array.isArray(this.teacherIds)) {
+      this.teacherIds = [];
+    }
+    const tidStr = this.teacherId.toString();
+    if (!this.teacherIds.some((id) => id && id.toString() === tidStr)) {
+      this.teacherIds.unshift(this.teacherId);
+    }
+  } else if (Array.isArray(this.teacherIds) && this.teacherIds.length > 0) {
+    this.teacherId = this.teacherIds[0];
+  }
+
   next();
 });
 

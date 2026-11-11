@@ -30,6 +30,14 @@ const startServer = async () => {
       // Background catch
     });
   }, 60 * 1000); // Check every 60 seconds
+
+  // Automated Background Dispatcher for Scheduled Chat Messages
+  const chatService = require('./services/chat.service');
+  setInterval(() => {
+    chatService.dispatchDueScheduledMessages().catch((err) => {
+      // Background catch
+    });
+  }, 15 * 1000); // Check every 15 seconds for timely delivery
 };
 
 startServer();

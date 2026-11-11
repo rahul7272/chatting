@@ -30,7 +30,7 @@ const MessageSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['TEXT', 'IMAGE', 'FILE', 'DOCUMENT', 'VOICE', 'AUDIO', 'LOCATION', 'POLL', 'SYSTEM'],
+      enum: ['TEXT', 'IMAGE', 'VIDEO', 'FILE', 'DOCUMENT', 'VOICE', 'AUDIO', 'LOCATION', 'POLL', 'SYSTEM'],
       default: 'TEXT',
     },
     metadata: {
@@ -47,6 +47,8 @@ const MessageSchema = new mongoose.Schema(
     ],
     pollData: {
       question: { type: String },
+      isMultipleChoice: { type: Boolean, default: false },
+      allowAnonymous: { type: Boolean, default: false },
       options: [
         {
           id: { type: String },
@@ -83,14 +85,56 @@ const MessageSchema = new mongoose.Schema(
         userName: { type: String },
       },
     ],
+    mentions: [
+      {
+        userId: { type: String },
+        name: { type: String, default: '' },
+      },
+    ],
+    mentionedNames: [
+      {
+        type: String,
+      },
+    ],
     isPinned: {
       type: Boolean,
       default: false,
+      index: true,
+    },
+    pinnedAt: {
+      type: Date,
+      default: null,
+    },
+    pinnedBy: {
+      type: String,
+      default: '',
     },
     isForwarded: {
       type: Boolean,
       default: false,
     },
+    isEdited: {
+      type: Boolean,
+      default: false,
+    },
+    editedAt: {
+      type: Date,
+      default: null,
+    },
+    isDeleted: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    deletedAt: {
+      type: Date,
+      default: null,
+    },
+    deletedFor: [
+      {
+        type: String,
+      },
+    ],
   },
   {
     timestamps: true,
@@ -98,5 +142,8 @@ const MessageSchema = new mongoose.Schema(
 );
 
 MessageSchema.index({ groupId: 1, createdAt: -1 });
+MessageSchema.index({ groupId: 1, isPinned: 1 });
+MessageSchema.index({ groupId: 1, type: 1 });
+MessageSchema.index({ text: 'text' });
 
 module.exports = mongoose.model('Message', MessageSchema);

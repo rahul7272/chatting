@@ -28,6 +28,26 @@ const findTeacher = async (id) => {
   return t;
 };
 
+// Helper to parse class start time e.g. "05:00 PM", "8 pm", "17:00", "05:00 PM - 06:00 PM"
+const parseStartTime = (timeStr) => {
+  if (!timeStr || typeof timeStr !== 'string') return { hour: 17, minute: 0 };
+  const firstPart = timeStr.split('-')[0].trim();
+  const match12 = firstPart.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
+  if (match12) {
+    let hour = parseInt(match12[1], 10);
+    const minute = match12[2] ? parseInt(match12[2], 10) : 0;
+    const meridian = match12[3].toLowerCase();
+    if (meridian === 'pm' && hour < 12) hour += 12;
+    if (meridian === 'am' && hour === 12) hour = 0;
+    return { hour, minute };
+  }
+  const match24 = firstPart.match(/^(\d{1,2}):(\d{2})/);
+  if (match24) {
+    return { hour: parseInt(match24[1], 10), minute: parseInt(match24[2], 10) };
+  }
+  return { hour: 17, minute: 0 };
+};
+
 /**
  * 1. Mark or Update Attendance (Teacher or Admin)
  * Teacher rule: Can only mark or update attendance for today or yesterday (last 1 day).
@@ -65,17 +85,44 @@ const markAttendance = async (req, res, next) => {
       const diffTime = todayDate.getTime() - normalizedClassDate.getTime();
       const diffDays = Math.round(diffTime / (1000 * 3600 * 24));
 
-      if (diffDays > 1) {
-        return errorResponse(
-          res,
-          'Teachers are restricted to updating attendance for today and yesterday (last 1 day) only. Older records are locked.',
-          statusCodes.FORBIDDEN
-        );
-      }
-      if (diffDays < 0) {
+      // Allow timezone differences (e.g. IST UTC+5:30 where local day starts up to 1 day ahead of UTC):
+      // diffDays < -1 means 2 or more days in advance (genuine future date)
+      if (diffDays < -1) {
         return errorResponse(
           res,
           'Attendance cannot be marked in advance for future dates.',
+          statusCodes.BAD_REQUEST
+        );
+      }
+      if (diffDays > 2) {
+        return errorResponse(
+          res,
+          'Teachers are restricted to updating attendance for today and yesterday only. Older records are locked.',
+          statusCodes.FORBIDDEN
+        );
+      }
+
+      // CLASS START TIME VALIDATION:
+      // Attendance cannot be marked before the scheduled class time has started!
+      // (e.g. class is at 8:00 PM, but current time is 7:00 PM)
+      const tz = group.schedule?.timezone || 'Asia/Kolkata';
+      const now = new Date();
+      const nowInTz = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+
+      const [cYear, cMonth, cDay] = dateOnlyStr.split('-').map(Number);
+      const startTimeStr = group.schedule?.startTime || '05:00 PM';
+      const { hour: startHour, minute: startMinute } = parseStartTime(startTimeStr);
+      const scheduledClassStart = new Date(cYear, cMonth - 1, cDay, startHour, startMinute, 0);
+
+      if (nowInTz.getTime() < scheduledClassStart.getTime()) {
+        const remainingMinutes = Math.ceil((scheduledClassStart.getTime() - nowInTz.getTime()) / 60000);
+        const remHours = Math.floor(remainingMinutes / 60);
+        const remMins = remainingMinutes % 60;
+        const timeRemainingStr = remHours > 0 ? `${remHours}h ${remMins}m` : `${remMins}m`;
+
+        return errorResponse(
+          res,
+          `Attendance cannot be marked before the scheduled class time (${startTimeStr}). Class starts in ${timeRemainingStr}.`,
           statusCodes.BAD_REQUEST
         );
       }
@@ -140,15 +187,20 @@ const markAttendance = async (req, res, next) => {
             const ratePerClass = 100;
             const payoutAmount = (ratePerClass * commissionPercent) / 100;
 
-            await TeacherLedger.create({
-              teacherId,
-              studentId: student._id,
-              groupId,
-              attendanceId: attendance._id,
-              calculatedAmount: payoutAmount,
-              commissionPercent,
-              status: 'PENDING',
-            });
+            await TeacherLedger.findOneAndUpdate(
+              { attendanceId: attendance._id },
+              {
+                $set: {
+                  teacherId,
+                  studentId: student._id,
+                  groupId,
+                  calculatedAmount: payoutAmount,
+                  commissionPercent,
+                  status: 'PENDING',
+                },
+              },
+              { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
 
             attendance.creditDeducted = true;
             attendance.payoutCalculated = true;
@@ -225,15 +277,20 @@ const markAttendance = async (req, res, next) => {
             const ratePerClass = 100;
             const payoutAmount = (ratePerClass * commissionPercent) / 100;
 
-            await TeacherLedger.create({
-              teacherId,
-              studentId: student._id,
-              groupId,
-              attendanceId: attendance._id,
-              calculatedAmount: payoutAmount,
-              commissionPercent,
-              status: 'PENDING',
-            });
+            await TeacherLedger.findOneAndUpdate(
+              { attendanceId: attendance._id },
+              {
+                $set: {
+                  teacherId,
+                  studentId: student._id,
+                  groupId,
+                  calculatedAmount: payoutAmount,
+                  commissionPercent,
+                  status: 'PENDING',
+                },
+              },
+              { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
 
             attendance.creditDeducted = true;
             attendance.payoutCalculated = true;
@@ -465,11 +522,13 @@ const getMyAttendance = async (req, res, next) => {
         scheduleTime: g.scheduleTime || '',
         scheduleDays: g.scheduleDays || '',
         meetUrl: g.meetUrl || '',
+        avatar: g.avatar || g.avatarUrl || g.groupPic || '',
+        avatarUrl: g.avatar || g.avatarUrl || g.groupPic || '',
         totalClasses: 0,
         presentCount: 0,
         absentCount: 0,
         excusedCount: 0,
-        attendancePercentage: 100,
+        attendancePercentage: 0,
         records: [],
       };
     });
@@ -489,11 +548,13 @@ const getMyAttendance = async (req, res, next) => {
           scheduleTime: r.groupId.scheduleTime || '',
           scheduleDays: r.groupId.scheduleDays || '',
           meetUrl: r.groupId.meetUrl || '',
+          avatar: r.groupId.avatar || r.groupId.avatarUrl || '',
+          avatarUrl: r.groupId.avatar || r.groupId.avatarUrl || '',
           totalClasses: 0,
           presentCount: 0,
           absentCount: 0,
           excusedCount: 0,
-          attendancePercentage: 100,
+          attendancePercentage: 0,
           records: [],
         };
       }
@@ -503,7 +564,7 @@ const getMyAttendance = async (req, res, next) => {
       if (r.status === 'PRESENT') b.presentCount += 1;
       else if (r.status === 'ABSENT') b.absentCount += 1;
       else if (r.status === 'EXCUSED') b.excusedCount += 1;
-      b.attendancePercentage = b.totalClasses > 0 ? Math.round((b.presentCount / b.totalClasses) * 100) : 100;
+      b.attendancePercentage = b.totalClasses > 0 ? Math.round((b.presentCount / b.totalClasses) * 100) : 0;
       b.records.push({
         id: r._id.toString(),
         classDate: r.classDate,
@@ -523,7 +584,7 @@ const getMyAttendance = async (req, res, next) => {
     const absentCount = records.filter((r) => r.status === 'ABSENT').length;
     const excusedCount = records.filter((r) => r.status === 'EXCUSED').length;
     const attendancePercentage =
-      totalClasses > 0 ? Math.round((presentCount / totalClasses) * 100) : 100;
+      totalClasses > 0 ? Math.round((presentCount / totalClasses) * 100) : 0;
 
     return successResponse(res, {
       summary: {
@@ -657,7 +718,7 @@ const getTeacherHistory = async (req, res, next) => {
       if (!sessionMap.has(key)) {
         const recMidnight = new Date(`${dateStr}T00:00:00.000Z`);
         const diffDays = Math.round((todayMidnight.getTime() - recMidnight.getTime()) / (1000 * 3600 * 24));
-        const isEditable = diffDays >= 0 && diffDays <= 1;
+        const isEditable = diffDays >= -1 && diffDays <= 2;
 
         sessionMap.set(key, {
           groupId: gId,

@@ -22,8 +22,10 @@ router.patch('/:id/schedule', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGE
 router.patch('/:id', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER]), groupController.updateGroup);
 router.delete('/:id', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER]), groupController.deleteOrArchiveGroup);
 
-// Teacher Assignment & Reassignment
+// Teacher Assignment & Reassignment (Supports Single & Multi-Teacher)
 router.post('/:id/assign-teacher', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER]), groupController.assignTeacher);
+router.post('/:id/teachers', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER]), groupController.addTeachers);
+router.delete('/:id/teachers/:teacherId', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER]), groupController.removeTeacher);
 
 // Student Membership
 router.post('/:id/students', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER]), groupController.addStudents);
@@ -36,6 +38,7 @@ router.post('/:id/recordings/:recordingId/watch', authenticate, groupController.
 
 // Notes & Assignments Resources
 router.post('/:id/resources', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER, ROLES.TEACHER]), groupController.addResource);
+router.patch('/:id/resources/:resourceId', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER, ROLES.TEACHER]), groupController.updateResource);
 router.delete('/:id/resources/:resourceId', authenticate, authorize([ROLES.ADMIN, ROLES.MANAGER, ROLES.TEACHER]), groupController.deleteResource);
 
 // Group Announcements

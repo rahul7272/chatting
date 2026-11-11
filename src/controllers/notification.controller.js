@@ -7,7 +7,7 @@ const Teacher = require('../models/Teacher');
 const User = require('../models/User');
 const { successResponse, errorResponse } = require('../utils/response');
 const statusCodes = require('../constants/statusCodes');
-const { broadcast } = require('../config/socket');
+const { broadcast, broadcastToUsers } = require('../config/socket');
 const socketEvents = require('../constants/socketEvents');
 const fcmService = require('../services/fcm.service');
 
@@ -24,6 +24,7 @@ const sendNotification = async (req, res, next) => {
       priority = 'STANDARD',
       targetAudience = 'ALL',
       targetGroupIds = [],
+      targetUserIds = [],
       actionUrl = '',
       meetUrl = '',
     } = req.body;
@@ -34,9 +35,13 @@ const sendNotification = async (req, res, next) => {
 
     const senderName = req.user?.name || 'Academy Administrator';
 
-    // Validate and fetch target groups if target is BATCH_GROUPS
+    // Validate and fetch target groups / users
     let resolvedGroupTitles = [];
     let validGroupIds = [];
+    let validUserIds = Array.isArray(targetUserIds)
+      ? targetUserIds.map((id) => id.toString().trim()).filter((id) => mongoose.Types.ObjectId.isValid(id))
+      : [];
+    let resolvedUserNames = [];
     let recipientCount = 0;
 
     if (targetAudience === 'BATCH_GROUPS' && Array.isArray(targetGroupIds) && targetGroupIds.length > 0) {
@@ -53,13 +58,25 @@ const sendNotification = async (req, res, next) => {
       });
       recipientCount = memberSet.size;
     } else if (targetAudience === 'STUDENTS') {
-      recipientCount = await Student.countDocuments({ isActive: true });
+      if (validUserIds.length > 0) {
+        const selectedStudents = await Student.find({ _id: { $in: validUserIds } }).select('name').lean();
+        resolvedUserNames = selectedStudents.map((s) => s.name);
+        recipientCount = validUserIds.length;
+      } else {
+        recipientCount = await Student.countDocuments({ isActive: { $ne: false }, status: { $ne: 'Left' } });
+      }
     } else if (targetAudience === 'TEACHERS') {
-      recipientCount = await Teacher.countDocuments({ isActive: true });
+      if (validUserIds.length > 0) {
+        const selectedTeachers = await Teacher.find({ _id: { $in: validUserIds } }).select('name').lean();
+        resolvedUserNames = selectedTeachers.map((t) => t.name);
+        recipientCount = validUserIds.length;
+      } else {
+        recipientCount = await Teacher.countDocuments({ isActive: { $ne: false }, status: { $ne: 'Left' } });
+      }
     } else {
       const [sCount, tCount] = await Promise.all([
-        Student.countDocuments({ isActive: true }),
-        Teacher.countDocuments({ isActive: true }),
+        Student.countDocuments({ isActive: { $ne: false }, status: { $ne: 'Left' } }),
+        Teacher.countDocuments({ isActive: { $ne: false }, status: { $ne: 'Left' } }),
       ]);
       recipientCount = sCount + tCount;
     }
@@ -73,6 +90,8 @@ const sendNotification = async (req, res, next) => {
       targetAudience,
       targetGroupIds: validGroupIds,
       targetGroupTitles: resolvedGroupTitles,
+      targetUserIds: validUserIds,
+      targetUserNames: resolvedUserNames,
       actionUrl: actionUrl.trim(),
       meetUrl: meetUrl.trim(),
       sentBy: senderName,
@@ -125,6 +144,9 @@ const sendNotification = async (req, res, next) => {
               notificationId: notification._id,
               isAnnouncement: true,
               priority,
+              title: title.trim(),
+              messageBody: message.trim(),
+              meetUrl: meetUrl || '',
               actionUrl: actionUrl || meetUrl,
             },
           });
@@ -139,7 +161,9 @@ const sendNotification = async (req, res, next) => {
 
     // Universal Real-Time Broadcast across Native WebSocket and Socket.IO
     try {
-      if (validGroupIds.length > 0) {
+      if (validUserIds.length > 0) {
+        broadcastToUsers('new_notification', notification, validUserIds);
+      } else if (validGroupIds.length > 0) {
         validGroupIds.forEach((gid) => {
           broadcast('new_notification', notification, gid.toString());
         });
@@ -187,19 +211,10 @@ const getNotifications = async (req, res, next) => {
     }
 
     const skip = (Number(page) - 1) * Number(limit);
-    let [notifications, total] = await Promise.all([
+    const [notifications, total] = await Promise.all([
       Notification.find(query).sort({ sentAt: -1 }).skip(skip).limit(Number(limit)).lean(),
       Notification.countDocuments(query),
     ]);
-
-    // Auto-seed dummy notices if database has none
-    if (total === 0 && !search && !type) {
-      await seedDummyNotifications();
-      [notifications, total] = await Promise.all([
-        Notification.find(query).sort({ sentAt: -1 }).skip(skip).limit(Number(limit)).lean(),
-        Notification.countDocuments(query),
-      ]);
-    }
 
     return successResponse(res, {
       notifications,
@@ -237,10 +252,29 @@ const getMyNotifications = async (req, res, next) => {
 
     // Build audience filter
     const audienceFilters = [{ targetAudience: 'ALL' }];
+    const userIdStr = userId ? userId.toString() : null;
     if (userRole === 'STUDENT') {
-      audienceFilters.push({ targetAudience: 'STUDENTS' });
+      audienceFilters.push({
+        targetAudience: 'STUDENTS',
+        $or: [
+          { targetUserIds: { $size: 0 } },
+          { targetUserIds: { $exists: false } },
+          ...(userIdStr ? [{ targetUserIds: userIdStr }] : []),
+        ],
+      });
     } else if (userRole === 'TEACHER') {
-      audienceFilters.push({ targetAudience: 'TEACHERS' });
+      audienceFilters.push({
+        targetAudience: 'TEACHERS',
+        $or: [
+          { targetUserIds: { $size: 0 } },
+          { targetUserIds: { $exists: false } },
+          ...(userIdStr ? [{ targetUserIds: userIdStr }] : []),
+        ],
+      });
+    }
+
+    if (userIdStr) {
+      audienceFilters.push({ targetAudience: 'INDIVIDUAL', targetUserIds: userIdStr });
     }
 
     if (userGroupIds.length > 0) {
@@ -250,22 +284,10 @@ const getMyNotifications = async (req, res, next) => {
       });
     }
 
-    let notifications = await Notification.find({ $or: audienceFilters })
+    const notifications = await Notification.find({ $or: audienceFilters })
       .sort({ sentAt: -1 })
       .limit(60)
       .lean();
-
-    // Auto-seed if database is completely empty
-    if (notifications.length === 0) {
-      const totalCount = await Notification.countDocuments();
-      if (totalCount === 0) {
-        await seedDummyNotifications();
-        notifications = await Notification.find({ $or: audienceFilters })
-          .sort({ sentAt: -1 })
-          .limit(60)
-          .lean();
-      }
-    }
 
     return successResponse(res, { notifications });
   } catch (err) {
@@ -479,11 +501,14 @@ const triggerClassAlerts = async (req, res, next) => {
 
     for (const group of activeGroups) {
       const schedule = group.schedule || {};
-      const days = schedule.days || [];
+      const days = schedule.dayNames?.length ? schedule.dayNames : (schedule.days || []);
+      const daysOfWeek = Array.isArray(schedule.daysOfWeek) ? schedule.daysOfWeek : [];
       const startTimeStr = schedule.startTime || '';
 
-      // Check if group meets today
-      const meetsToday = days.some((d) => d.toLowerCase().includes(currentDayName.toLowerCase()));
+      // Check if group meets today (supports dayNames, days, or numeric daysOfWeek)
+      const meetsToday =
+        daysOfWeek.includes(now.getDay()) ||
+        days.some((d) => d.toLowerCase().includes(currentDayName.toLowerCase()));
       if (!meetsToday && !forceAll) continue;
 
       const classMinutes = parseTimeToMinutes(startTimeStr);
@@ -500,14 +525,20 @@ const triggerClassAlerts = async (req, res, next) => {
       if (isT15 || isT5) {
         const alertType = isT5 ? 'CLASS_ALERT_5M' : 'CLASS_REMINDER_15M';
         const priority = isT5 ? 'HIGH' : 'STANDARD';
-        const title = isT5
+        const templates = group.alertTemplates || {};
+
+        const defaultTitle = isT5
           ? `⚡ Urgent Class Alert: ${group.title} starts in 5 minutes!`
           : `🔔 Class Reminder: ${group.title} begins in 15 minutes`;
 
-        const meetLink = group.meetLink || group.googleMeet?.meetUrl || '';
-        const message = isT5
+        const title = (isT5 ? templates.t5Title : templates.t15Title)?.trim() || defaultTitle;
+
+        const meetLink = group.meetUrl || group.meetLink || group.googleMeet?.meetUrl || '';
+        const defaultMessage = isT5
           ? `Your live music session is starting right now. Tap "Join Now" to enter the classroom.`
           : `Get your instruments ready. Class is scheduled for ${startTimeStr || 'soon'}.${meetLink ? ` Meet link is ready.` : ''}`;
+
+        const message = (isT5 ? templates.t5Message : templates.t15Message)?.trim() || defaultMessage;
 
         const notification = await Notification.create({
           title,
@@ -572,12 +603,12 @@ const triggerClassAlerts = async (req, res, next) => {
 };
 
 /**
- * Test Fire a T-15m or T-5m class alert for a specific batch on demand
+ * Test Fire a T-15m or T-5m class alert (or custom message) for a specific batch on demand
  */
 const triggerTestAlert = async (req, res, next) => {
   try {
     const { groupId } = req.params;
-    const { alertType = 'T-5' } = req.body; // 'T-15' or 'T-5'
+    const { alertType = 'T-5', customTitle, customMessage, postToChat = false } = req.body; // 'T-15' | 'T-5' | 'CUSTOM'
 
     const group = await Group.findById(groupId).lean();
     if (!group) {
@@ -585,17 +616,30 @@ const triggerTestAlert = async (req, res, next) => {
     }
 
     const isT5 = alertType === 'T-5';
-    const typeEnum = isT5 ? 'CLASS_ALERT_5M' : 'CLASS_REMINDER_15M';
+    const isCustom = alertType === 'CUSTOM';
+    const typeEnum = isCustom ? 'ANNOUNCEMENT' : (isT5 ? 'CLASS_ALERT_5M' : 'CLASS_REMINDER_15M');
     const priority = isT5 ? 'HIGH' : 'STANDARD';
-    const meetLink = group.meetLink || group.googleMeet?.meetUrl || 'https://meet.google.com/live-class';
+    const meetLink = group.meetUrl || group.meetLink || group.googleMeet?.meetUrl || '';
+    const templates = group.alertTemplates || {};
+    const senderName = req.user?.name || 'Admin Console';
 
-    const title = isT5
-      ? `⚡ [TEST] High-Priority Class Alert: ${group.title} in 5 mins!`
-      : `🔔 [TEST] Class Reminder: ${group.title} in 15 mins`;
+    const fallbackTitle = isCustom
+      ? `📢 Class Notice: ${group.title}`
+      : (isT5
+          ? `⚡ High-Priority Class Alert: ${group.title} starts in 5 mins!`
+          : `🔔 Class Reminder: ${group.title} starts in 15 mins`);
 
-    const message = isT5
-      ? `High-priority test alert sent by Admin. Tap "Join Now" to test joining classroom.`
-      : `Standard class reminder test sent by Admin for ${group.title}.`;
+    const fallbackMessage = isCustom
+      ? `Please check the latest update for ${group.title}.`
+      : (isT5
+          ? `Your live class for ${group.title} is starting soon. Tap "Join Now" to enter.`
+          : `Reminder: ${group.title} class begins in 15 minutes. Keep your instruments ready.`);
+
+    const savedTemplateTitle = isT5 ? templates.t5Title : (!isCustom ? templates.t15Title : '');
+    const savedTemplateMsg = isT5 ? templates.t5Message : (!isCustom ? templates.t15Message : '');
+
+    const title = (customTitle && customTitle.trim()) || (savedTemplateTitle && savedTemplateTitle.trim()) || fallbackTitle;
+    const message = (customMessage && customMessage.trim()) || (savedTemplateMsg && savedTemplateMsg.trim()) || fallbackMessage;
 
     const notification = await Notification.create({
       title,
@@ -608,20 +652,44 @@ const triggerTestAlert = async (req, res, next) => {
       classId: group._id,
       classTitle: group.title,
       meetUrl: meetLink,
-      actionUrl: meetLink,
-      sentBy: req.user?.name || 'Admin Console',
+      actionUrl: meetLink || `/groups/${group._id}`,
+      sentBy: senderName,
       sentAt: new Date(),
       recipientsCount: (group.studentIds?.length || 0) + (group.teacherIds?.length || 0),
       metadata: {
-        isTest: true,
-        alertWindow: isT5 ? 'T-5m' : 'T-15m',
+        isTest: !isCustom,
+        alertWindow: isCustom ? 'Custom' : (isT5 ? 'T-5m' : 'T-15m'),
       },
     });
+
+    // Optionally also push system notice card into batch chat
+    if (postToChat) {
+      try {
+        const systemMsg = await Message.create({
+          groupId: group._id,
+          senderName,
+          text: `📢 [${priority === 'HIGH' ? 'URGENT NOTICE' : 'ANNOUNCEMENT'}]: ${title}\n${message}${meetLink ? `\n🔗 Class Link: ${meetLink}` : ''}`,
+          type: 'SYSTEM',
+          metadata: {
+            notificationId: notification._id,
+            isAnnouncement: true,
+            priority,
+            title,
+            messageBody: message,
+            meetUrl: meetLink,
+            actionUrl: meetLink,
+          },
+        });
+        broadcast(socketEvents.NEW_MESSAGE, systemMsg, group._id.toString());
+      } catch (chatErr) {
+        console.warn('[Alert Chat Broadcast Warning]:', chatErr.message);
+      }
+    }
 
     // Broadcast over WebSocket to all clients in group
     try {
       broadcast('new_notification', notification, group._id.toString());
-      broadcast('new_notification', notification); // Also universal for test
+      broadcast('new_notification', notification); // Also universal for instant delivery
     } catch (e) {
       console.warn('[Broadcast Error in triggerTestAlert]:', e.message);
     }
@@ -634,7 +702,53 @@ const triggerTestAlert = async (req, res, next) => {
     return successResponse(
       res,
       { notification },
-      `Test ${isT5 ? 'T-5 Minute High-Priority Alert' : 'T-15 Minute Reminder'} triggered successfully.`
+      isCustom
+        ? `Custom notice dispatched to ${group.title}.`
+        : `${isT5 ? 'T-5 Minute High-Priority Alert' : 'T-15 Minute Reminder'} dispatched to ${group.title}.`
+    );
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Update custom editable T-15m & T-5m alert messages for a specific batch
+ * PUT /api/v1/notifications/batch-alerts/:groupId
+ */
+const updateBatchAlertTemplates = async (req, res, next) => {
+  try {
+    const { groupId } = req.params;
+    if (!groupId || !mongoose.Types.ObjectId.isValid(groupId)) {
+      return errorResponse(res, 'Invalid batch ID.', statusCodes.BAD_REQUEST);
+    }
+
+    const { t15Title = '', t15Message = '', t5Title = '', t5Message = '' } = req.body;
+
+    const updated = await Group.findByIdAndUpdate(
+      groupId,
+      {
+        $set: {
+          alertTemplates: {
+            t15Title: String(t15Title).trim(),
+            t15Message: String(t15Message).trim(),
+            t5Title: String(t5Title).trim(),
+            t5Message: String(t5Message).trim(),
+          },
+        },
+      },
+      { new: true }
+    )
+      .select('title code alertTemplates')
+      .lean();
+
+    if (!updated) {
+      return errorResponse(res, 'Batch group not found.', statusCodes.NOT_FOUND);
+    }
+
+    return successResponse(
+      res,
+      { batch: updated },
+      `Alert message templates updated for ${updated.title}.`
     );
   } catch (err) {
     next(err);
@@ -666,7 +780,7 @@ const registerDeviceToken = async (req, res, next) => {
 const getBatchesForNotifications = async (req, res, next) => {
   try {
     const groups = await Group.find({ status: { $ne: 'Archived' } })
-      .select('title code status schedule meetLink googleMeet studentIds teacherIds')
+      .select('title code status schedule meetUrl meetLink googleMeet alertTemplates studentIds teacherIds')
       .lean();
 
     const formatted = groups.map((g) => ({
@@ -676,12 +790,59 @@ const getBatchesForNotifications = async (req, res, next) => {
       code: g.code,
       status: g.status,
       schedule: g.schedule,
-      meetUrl: g.meetLink || g.googleMeet?.meetUrl || '',
+      meetUrl: g.meetUrl || g.meetLink || g.googleMeet?.meetUrl || '',
+      alertTemplates: g.alertTemplates || {},
       studentCount: g.studentIds?.length || 0,
       teacherCount: g.teacherIds?.length || 0,
     }));
 
     return successResponse(res, { batches: formatted });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * Get active students, teachers, and batches with total counts for composer drawer
+ * GET /api/v1/notifications/audience-directory
+ */
+const getAudienceDirectory = async (req, res, next) => {
+  try {
+    const [students, teachers, groups] = await Promise.all([
+      Student.find({ isActive: { $ne: false }, status: { $ne: 'Left' } })
+        .select('name phoneNumber email enrollmentNo batchName instruments studentLevel status')
+        .sort({ name: 1 })
+        .lean(),
+      Teacher.find({ isActive: { $ne: false }, status: { $ne: 'Left' } })
+        .select('name phoneNumber email instruments qualification assignedBatches status')
+        .sort({ name: 1 })
+        .lean(),
+      Group.find({ status: { $ne: 'Archived' } })
+        .select('title code status schedule meetUrl meetLink googleMeet studentIds teacherIds')
+        .sort({ title: 1 })
+        .lean(),
+    ]);
+
+    const batches = groups.map((g) => ({
+      id: g._id,
+      _id: g._id,
+      title: g.title,
+      code: g.code,
+      status: g.status,
+      schedule: g.schedule,
+      meetUrl: g.meetUrl || g.meetLink || g.googleMeet?.meetUrl || '',
+      studentCount: g.studentIds?.length || 0,
+      teacherCount: g.teacherIds?.length || 0,
+    }));
+
+    return successResponse(res, {
+      totalStudents: students.length,
+      totalTeachers: teachers.length,
+      totalBatches: batches.length,
+      students,
+      teachers,
+      batches,
+    });
   } catch (err) {
     next(err);
   }
@@ -701,15 +862,45 @@ const sendSinglePush = async (req, res, next) => {
   }
 };
 
+/**
+ * Bulk delete multiple notifications by IDs
+ * DELETE /api/v1/notifications/bulk-delete
+ * Body: { ids: string[] }  — OR empty body / { all: true } to delete ALL
+ */
+const bulkDeleteNotifications = async (req, res, next) => {
+  try {
+    const { ids, all } = req.body;
+
+    if (all === true) {
+      // Delete every notification in the collection
+      const result = await Notification.deleteMany({});
+      return successResponse(res, { deletedCount: result.deletedCount }, `All ${result.deletedCount} notifications deleted.`);
+    }
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return errorResponse(res, 'Provide an array of notification IDs or set all:true.', statusCodes.BAD_REQUEST);
+    }
+
+    const validIds = ids.filter((id) => mongoose.Types.ObjectId.isValid(id));
+    const result = await Notification.deleteMany({ _id: { $in: validIds } });
+    return successResponse(res, { deletedCount: result.deletedCount }, `${result.deletedCount} notification(s) deleted.`);
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   sendNotification,
   getNotifications,
   getMyNotifications,
   markAsRead,
   deleteNotification,
+  bulkDeleteNotifications,
   triggerClassAlerts,
   triggerTestAlert,
+  updateBatchAlertTemplates,
   getBatchesForNotifications,
+  getAudienceDirectory,
   seedDummyNotifications,
   registerDeviceToken,
   sendSinglePush,

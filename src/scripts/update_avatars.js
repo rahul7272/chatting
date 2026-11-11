@@ -4,7 +4,7 @@ const mongoose = require('mongoose');
 async function run() {
   await mongoose.connect(process.env.MONGO_URI);
   const Group = require('../models/Group');
-  const avatarUrl = 'http://192.168.1.10:5000/uploads/images/1791140048753_Education_App_Chat_Flow_UI_Mockup.png';
+  const avatarUrl = 'https://chatting.drsumanbehmani.com/uploads/images/1791140048753_Education_App_Chat_Flow_UI_Mockup.png';
 
   const dxGroup = await Group.findById('6ac16b8e2014553d27539262');
   dxGroup.avatar = avatarUrl;

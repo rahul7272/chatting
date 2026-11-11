@@ -15,8 +15,8 @@ const ResourceSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ['RECORDING', 'NOTE', 'ASSIGNMENT', 'EXTERNAL_LINK'],
-      required: true,
+      default: 'NOTE',
+      trim: true,
       index: true,
     },
     fileUrl: {

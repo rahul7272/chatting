@@ -17,6 +17,7 @@ class FcmService {
         priority = 'STANDARD',
         targetAudience = 'ALL',
         targetGroupIds = [],
+        targetUserIds = [],
         meetUrl = '',
         actionUrl = '',
         _id,
@@ -83,9 +84,11 @@ class FcmService {
         },
       };
 
-      // Determine Topics (Never broadcast chat messages to bulk topics where the sender cannot be excluded)
+      const hasSpecificUsers = Array.isArray(targetUserIds) && targetUserIds.length > 0;
+
+      // Determine Topics (Never broadcast chat messages or specific-user messages to bulk topics)
       const topics = [];
-      if (!isChatMessage) {
+      if (!isChatMessage && !hasSpecificUsers) {
         if (targetAudience === 'ALL') {
           topics.push('all');
         } else if (targetAudience === 'STUDENTS') {
@@ -119,7 +122,16 @@ class FcmService {
       // 2. Collect Registered User Tokens if targeting specific users/batches
       let tokens = [];
       const excludeFilter = excludeUserId ? { _id: { $ne: excludeUserId } } : {};
-      if (targetAudience === 'BATCH_GROUPS' && targetGroupIds.length > 0) {
+      if (hasSpecificUsers) {
+        const [students, teachers, users] = await Promise.all([
+          Student.find({ _id: { $in: targetUserIds }, ...excludeFilter }).select('fcmTokens').lean(),
+          Teacher.find({ _id: { $in: targetUserIds }, ...excludeFilter }).select('fcmTokens').lean(),
+          User.find({ _id: { $in: targetUserIds }, ...excludeFilter }).select('fcmTokens').lean(),
+        ]);
+        students.forEach((s) => (s.fcmTokens || []).forEach((t) => t && tokens.push(t)));
+        teachers.forEach((t) => (t.fcmTokens || []).forEach((tok) => tok && tokens.push(tok)));
+        users.forEach((u) => (u.fcmTokens || []).forEach((tok) => tok && tokens.push(tok)));
+      } else if (targetAudience === 'BATCH_GROUPS' && targetGroupIds.length > 0) {
         // Collect tokens from enrolled students and teachers in these batches (excluding sender)
         const [students, teachers] = await Promise.all([
           Student.find({ batchIds: { $in: targetGroupIds }, isActive: true, ...excludeFilter }).select('fcmTokens').lean(),
@@ -197,13 +209,98 @@ class FcmService {
       const groupTitle = group?.title || group?.name || '';
 
       let previewText = message.text || '';
-      if (message.type === 'VOICE') previewText = '🎤 Voice message';
-      else if (message.type === 'IMAGE') previewText = '📷 Photo';
+      if (message.type === 'VOICE' || message.type === 'AUDIO') {
+        const isDeviceAudio = message.metadata?.isVoiceNote === false;
+        previewText = isDeviceAudio
+          ? (message.text ? `🎵 Audio: ${message.text}` : '🎵 Audio file')
+          : '🎤 Voice message';
+      }
+      else if (message.type === 'VIDEO') {
+        previewText = message.text ? `🎥 Video: ${message.text}` : '🎥 Video';
+      }
+      else if (message.type === 'IMAGE') {
+        const attachCount = Array.isArray(message.attachments) && message.attachments.length > 0 ? message.attachments.length : 1;
+        const imgLabel = attachCount > 1 ? `📷 ${attachCount} Photos` : '📷 Photo';
+        previewText = message.text ? `${imgLabel}: ${message.text}` : imgLabel;
+      }
       else if (message.type === 'DOCUMENT') previewText = '📎 Document';
       else if (message.type === 'POLL') previewText = `📊 Poll: ${message.pollData?.question || 'New Poll'}`;
 
       const title = groupTitle ? `${senderName} (${groupTitle})` : senderName;
       const body = previewText || 'Sent an attachment';
+
+      // Check for targeted User Mentions
+      const rawMentions = Array.isArray(message.mentions) ? message.mentions : [];
+      const isEveryoneMentioned = rawMentions.some((m) => m.userId === 'all' || m.name?.toLowerCase() === 'everyone');
+      const specificMentionedUserIds = rawMentions
+        .filter((m) => m && m.userId && m.userId !== 'all' && m.userId !== actualSenderId?.toString())
+        .map((m) => m.userId.toString());
+
+      if (isEveryoneMentioned) {
+        // High priority broadcast to the entire batch
+        const mentionPayload = {
+          title: `📣 ${senderName} mentioned everyone in ${groupTitle || 'Batch'}`,
+          message: body,
+          type: 'CHAT_MESSAGE',
+          priority: 'HIGH',
+          targetAudience: 'BATCH_GROUPS',
+          targetGroupIds: groupId ? [groupId] : [],
+          actionUrl: `/chat/${groupId}`,
+          _id: message._id,
+          groupId: groupId ? groupId.toString() : '',
+          groupTitle: groupTitle,
+          senderId: actualSenderId ? actualSenderId.toString() : '',
+          senderName: senderName,
+          excludeUserId: actualSenderId ? actualSenderId.toString() : null,
+        };
+        await this.dispatchNotification(mentionPayload);
+        return;
+      }
+
+      // If specific individuals are mentioned, send them dedicated high-priority heads-up notifications
+      if (specificMentionedUserIds.length > 0) {
+        try {
+          const mentionedUsers = await Promise.all([
+            Student.find({ _id: { $in: specificMentionedUserIds } }).select('fcmTokens').lean().catch(() => []),
+            Teacher.find({ _id: { $in: specificMentionedUserIds } }).select('fcmTokens').lean().catch(() => []),
+            User.find({ _id: { $in: specificMentionedUserIds } }).select('fcmTokens').lean().catch(() => []),
+          ]);
+          let mentionTokens = [];
+          mentionedUsers.flat().forEach((u) => {
+            (u.fcmTokens || []).forEach((t) => t && mentionTokens.push(t));
+          });
+          mentionTokens = [...new Set(mentionTokens)].filter((t) => typeof t === 'string' && t.length > 10);
+
+          if (mentionTokens.length > 0 && admin.apps && admin.apps.length > 0) {
+            await admin.messaging().sendEachForMulticast({
+              tokens: mentionTokens,
+              notification: {
+                title: `@${senderName} mentioned you in ${groupTitle || 'Batch'}`,
+                body: body,
+              },
+              data: {
+                click_action: 'FLUTTER_NOTIFICATION_CLICK',
+                groupId: groupId ? groupId.toString() : '',
+                groupTitle: groupTitle,
+                actionUrl: `/chat/${groupId}`,
+                type: 'CHAT_MENTION',
+                priority: 'HIGH',
+              },
+              android: {
+                priority: 'high',
+                notification: {
+                  channelId: 'high_importance_channel',
+                  sound: 'default',
+                  priority: 'max',
+                },
+              },
+            });
+            logger.info(`[FCM Mention Notification] Sent to ${mentionTokens.length} devices.`);
+          }
+        } catch (mentionPushErr) {
+          logger.warn(`[FCM Mention Warning]: ${mentionPushErr.message}`);
+        }
+      }
 
       const payload = {
         title,

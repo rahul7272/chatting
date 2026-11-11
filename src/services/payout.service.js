@@ -10,15 +10,20 @@ class PayoutService {
     const feePerClass = 100;
     const payoutAmount = (feePerClass * commissionPercent) / 100;
 
-    return await TeacherLedger.create({
-      teacherId,
-      studentId,
-      groupId,
-      attendanceId,
-      calculatedAmount: payoutAmount,
-      commissionPercent,
-      status: 'PENDING',
-    });
+    return await TeacherLedger.findOneAndUpdate(
+      { attendanceId },
+      {
+        $set: {
+          teacherId,
+          studentId,
+          groupId,
+          calculatedAmount: payoutAmount,
+          commissionPercent,
+          status: 'PENDING',
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
   }
 
   async getTeacherLedger(teacherId) {

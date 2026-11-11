@@ -34,4 +34,6 @@ module.exports = {
   RECORDINGS_UPDATED: 'recordings_updated',
   RESOURCES_UPDATED: 'resources_updated',
   MEMBERS_UPDATED: 'members_updated',
+  SCHEDULED_MESSAGES_UPDATED: 'scheduled_messages_updated',
+  SCHEDULED_MESSAGE_SENT: 'scheduled_message_sent',
 };
