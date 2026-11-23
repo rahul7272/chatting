@@ -7,10 +7,12 @@ const Group = require('../models/Group');
 const Credit = require('../models/Credit');
 const RenewalTask = require('../models/RenewalTask');
 const TeacherLedger = require('../models/TeacherLedger');
+const AuditLog = require('../models/AuditLog');
 const { successResponse, errorResponse } = require('../utils/response');
 const statusCodes = require('../constants/statusCodes');
 const { ROLES } = require('../constants/roles');
 const fcmService = require('../services/fcm.service');
+const payoutService = require('../services/payout.service');
 
 // Helper to reliably find a student across Student and User collections
 const findStudent = async (id) => {
@@ -48,6 +50,12 @@ const parseStartTime = (timeStr) => {
   return { hour: 17, minute: 0 };
 };
 
+// Status classification helpers for credit deduction:
+// Deductible: PRESENT (attended) and ABSENT (unexcused absence) both deduct 1 credit (-1)
+// Exempt: LEAVE and EXCUSED (approved leaves) do NOT deduct credits (0 deduction)
+const isCreditDeductible = (st) => st === 'PRESENT' || st === 'ABSENT';
+const isCreditExempt = (st) => st === 'LEAVE' || st === 'EXCUSED';
+
 /**
  * 1. Mark or Update Attendance (Teacher or Admin)
  * Teacher rule: Can only mark or update attendance for today or yesterday (last 1 day).
@@ -66,7 +74,7 @@ const markAttendance = async (req, res, next) => {
 
     const group = await Group.findById(groupId);
     if (!group) {
-      return errorResponse(res, 'Target cohort / batch not found.', statusCodes.NOT_FOUND);
+      return errorResponse(res, 'Target group / batch not found.', statusCodes.NOT_FOUND);
     }
 
     // Normalize date to UTC midnight for consistent daily uniqueness
@@ -138,24 +146,44 @@ const markAttendance = async (req, res, next) => {
       const newStatus = item.status.toUpperCase();
       const remarks = item.remarks || '';
 
+      const sIdStr = studentId.toString();
+      const sIdObj = mongoose.Types.ObjectId.isValid(sIdStr) ? new mongoose.Types.ObjectId(sIdStr) : null;
+      const sIdCandidates = [sIdStr];
+      if (sIdObj) sIdCandidates.push(sIdObj);
+
+      const gIdStr = groupId.toString();
+      const gIdObj = mongoose.Types.ObjectId.isValid(gIdStr) ? new mongoose.Types.ObjectId(gIdStr) : null;
+      const gIdCandidates = [gIdStr];
+      if (gIdObj) gIdCandidates.push(gIdObj);
+
       // Check if attendance already exists for this student on this day in this group
       const startOfDay = new Date(`${dateOnlyStr}T00:00:00.000Z`);
       const endOfDay = new Date(`${dateOnlyStr}T23:59:59.999Z`);
       let attendance = await Attendance.findOne({
-        groupId,
-        studentId,
+        groupId: { $in: gIdCandidates },
+        studentId: { $in: sIdCandidates },
         classDate: { $gte: startOfDay, $lte: endOfDay },
       });
 
       if (attendance) {
         // UPDATE existing record
         const oldStatus = attendance.status;
+        const wasDeducted = Boolean(attendance.creditDeducted);
+        const isNowDeductible = isCreditDeductible(newStatus);
+        const isNowExempt = isCreditExempt(newStatus);
+
         attendance.status = newStatus;
         attendance.remarks = remarks;
         attendance.markedBy = userId;
 
-        // If changed to PRESENT from ABSENT/EXCUSED: deduct credit & calculate ledger
-        if (oldStatus !== 'PRESENT' && newStatus === 'PRESENT') {
+        // Ensure active teacher attribution is permanently stored on Attendance record
+        if (!attendance.teacherId && teacherId) {
+          attendance.teacherId = teacherId;
+        }
+
+        // 1. Student Credit Balance Adjustment
+        // Case A: Was NOT deducted -> Now Deductible (e.g. from LEAVE/EXCUSED to PRESENT or ABSENT)
+        if (!wasDeducted && isNowDeductible) {
           const student = await findStudent(studentId);
           if (student) {
             const newBalance = (student.enrolledCreditBalance || 0) - 1;
@@ -166,7 +194,7 @@ const markAttendance = async (req, res, next) => {
               studentId: student._id,
               delta: -1,
               resultingBalance: newBalance,
-              reason: 'CLASS_ATTENDANCE',
+              reason: newStatus === 'PRESENT' ? 'CLASS_ATTENDANCE' : 'UNEXCUSED_ABSENCE',
               referenceId: attendance._id,
             });
 
@@ -181,33 +209,24 @@ const markAttendance = async (req, res, next) => {
               }
             }
 
-            // Calculate Teacher Payout
-            const teacher = await findTeacher(teacherId);
-            const commissionPercent = teacher ? (teacher.commissionPercentage || 50) : 50;
-            const ratePerClass = 100;
-            const payoutAmount = (ratePerClass * commissionPercent) / 100;
-
-            await TeacherLedger.findOneAndUpdate(
-              { attendanceId: attendance._id },
-              {
-                $set: {
-                  teacherId,
-                  studentId: student._id,
-                  groupId,
-                  calculatedAmount: payoutAmount,
-                  commissionPercent,
-                  status: 'PENDING',
-                },
-              },
-              { upsert: true, new: true, setDefaultsOnInsert: true }
-            );
-
             attendance.creditDeducted = true;
-            attendance.payoutCalculated = true;
+
+            if (mongoose.Types.ObjectId.isValid(userId)) {
+              await AuditLog.create({
+                actorId: userId,
+                action: newStatus === 'PRESENT' ? 'ATTENDANCE_PRESENT_CREDIT_DEDUCTED' : 'ATTENDANCE_ABSENT_CREDIT_DEDUCTED',
+                entity: 'Attendance',
+                entityId: attendance._id,
+                oldValue: { status: oldStatus, creditDeducted: false },
+                newValue: { status: newStatus, creditDeducted: true },
+                ipAddress: req.ip || '',
+                userAgent: req.get('user-agent') || '',
+              }).catch(() => null);
+            }
           }
         }
-        // If changed from PRESENT to ABSENT/EXCUSED: refund credit
-        else if (oldStatus === 'PRESENT' && newStatus !== 'PRESENT') {
+        // Case B: Was Deducted -> Now Exempt (e.g. from PRESENT or ABSENT to LEAVE or EXCUSED)
+        else if (wasDeducted && isNowExempt) {
           const student = await findStudent(studentId);
           if (student) {
             const newBalance = (student.enrolledCreditBalance || 0) + 1;
@@ -222,13 +241,66 @@ const markAttendance = async (req, res, next) => {
               referenceId: attendance._id,
             });
 
-            await TeacherLedger.updateMany(
-              { attendanceId: attendance._id },
-              { status: 'CANCELLED' }
-            );
-
             attendance.creditDeducted = false;
-            attendance.payoutCalculated = false;
+
+            if (mongoose.Types.ObjectId.isValid(userId)) {
+              await AuditLog.create({
+                actorId: userId,
+                action: 'ATTENDANCE_EXEMPT_CREDIT_REFUNDED',
+                entity: 'Attendance',
+                entityId: attendance._id,
+                oldValue: { status: oldStatus, creditDeducted: true },
+                newValue: { status: newStatus, creditDeducted: false },
+                ipAddress: req.ip || '',
+                userAgent: req.get('user-agent') || '',
+              }).catch(() => null);
+            }
+          }
+        }
+        // Case C: Between deductibles (PRESENT <-> ABSENT)
+        // 1 credit was already deducted for this session; balance does not change.
+
+        // 2. Teacher Compensation Lifecycle
+        // Teacher earns payout ONLY for attended classes (PRESENT)
+        if (newStatus === 'PRESENT') {
+          const activeTeacherId = attendance.teacherId || teacherId;
+          await payoutService.recordTeacherEarning({
+            teacherId: activeTeacherId,
+            studentId,
+            groupId,
+            attendanceId: attendance._id,
+            classDate: normalizedClassDate,
+          });
+          attendance.payoutCalculated = true;
+
+          if (oldStatus !== 'PRESENT' && mongoose.Types.ObjectId.isValid(userId)) {
+            await AuditLog.create({
+              actorId: userId,
+              action: 'ATTENDANCE_MARKED_PRESENT_PAYOUT_GENERATED',
+              entity: 'Attendance',
+              entityId: attendance._id,
+              oldValue: { status: oldStatus },
+              newValue: { status: newStatus, payoutStatus: 'PENDING' },
+              ipAddress: req.ip || '',
+              userAgent: req.get('user-agent') || '',
+            }).catch(() => null);
+          }
+        } else if (oldStatus === 'PRESENT' && newStatus !== 'PRESENT') {
+          // Switching from PRESENT to ABSENT or LEAVE/EXCUSED: reverse the teacher payout
+          await payoutService.reverseTeacherEarning(attendance._id, 'ATTENDANCE_CORRECTION');
+          attendance.payoutCalculated = false;
+
+          if (mongoose.Types.ObjectId.isValid(userId)) {
+            await AuditLog.create({
+              actorId: userId,
+              action: 'ATTENDANCE_CORRECTION_PAYOUT_REVERSED',
+              entity: 'Attendance',
+              entityId: attendance._id,
+              oldValue: { status: oldStatus, payoutStatus: 'PENDING' },
+              newValue: { status: newStatus, payoutStatus: 'REVERSED' },
+              ipAddress: req.ip || '',
+              userAgent: req.get('user-agent') || '',
+            }).catch(() => null);
           }
         }
 
@@ -237,8 +309,8 @@ const markAttendance = async (req, res, next) => {
       } else {
         // CREATE new attendance record
         attendance = new Attendance({
-          groupId,
-          studentId,
+          groupId: gIdObj || gIdStr,
+          studentId: sIdObj || sIdStr,
           teacherId,
           classDate: normalizedClassDate,
           status: newStatus,
@@ -246,7 +318,8 @@ const markAttendance = async (req, res, next) => {
           remarks,
         });
 
-        if (newStatus === 'PRESENT') {
+        // If PRESENT or ABSENT: cut 1 credit from student
+        if (isCreditDeductible(newStatus)) {
           const student = await findStudent(studentId);
           if (student) {
             const newBalance = (student.enrolledCreditBalance || 0) - 1;
@@ -257,7 +330,7 @@ const markAttendance = async (req, res, next) => {
               studentId: student._id,
               delta: -1,
               resultingBalance: newBalance,
-              reason: 'CLASS_ATTENDANCE',
+              reason: newStatus === 'PRESENT' ? 'CLASS_ATTENDANCE' : 'UNEXCUSED_ABSENCE',
               referenceId: attendance._id,
             });
 
@@ -272,29 +345,43 @@ const markAttendance = async (req, res, next) => {
               }
             }
 
-            const teacher = await findTeacher(teacherId);
-            const commissionPercent = teacher ? (teacher.commissionPercentage || 50) : 50;
-            const ratePerClass = 100;
-            const payoutAmount = (ratePerClass * commissionPercent) / 100;
-
-            await TeacherLedger.findOneAndUpdate(
-              { attendanceId: attendance._id },
-              {
-                $set: {
-                  teacherId,
-                  studentId: student._id,
-                  groupId,
-                  calculatedAmount: payoutAmount,
-                  commissionPercent,
-                  status: 'PENDING',
-                },
-              },
-              { upsert: true, new: true, setDefaultsOnInsert: true }
-            );
-
             attendance.creditDeducted = true;
-            attendance.payoutCalculated = true;
+
+            // Teacher payout is earned ONLY when student is PRESENT
+            if (newStatus === 'PRESENT') {
+              const activeTeacherId = attendance.teacherId || teacherId;
+              await payoutService.recordTeacherEarning({
+                teacherId: activeTeacherId,
+                studentId: student._id,
+                groupId,
+                attendanceId: attendance._id,
+                classDate: normalizedClassDate,
+              });
+              attendance.payoutCalculated = true;
+            } else {
+              attendance.payoutCalculated = false;
+            }
+
+            // Audit log the attendance creation
+            if (mongoose.Types.ObjectId.isValid(userId)) {
+              await AuditLog.create({
+                actorId: userId,
+                action: newStatus === 'PRESENT'
+                  ? 'ATTENDANCE_MARKED_PRESENT_PAYOUT_GENERATED'
+                  : 'ATTENDANCE_MARKED_ABSENT_CREDIT_DEDUCTED',
+                entity: 'Attendance',
+                entityId: attendance._id,
+                oldValue: null,
+                newValue: { status: newStatus, creditDeducted: true, payoutStatus: newStatus === 'PRESENT' ? 'PENDING' : 'NONE' },
+                ipAddress: req.ip || '',
+                userAgent: req.get('user-agent') || '',
+              }).catch(() => null);
+            }
           }
+        } else {
+          // Approved LEAVE or EXCUSED: 0 credit cut, 0 payout
+          attendance.creditDeducted = false;
+          attendance.payoutCalculated = false;
         }
 
         await attendance.save();
@@ -314,10 +401,43 @@ const markAttendance = async (req, res, next) => {
       }
     } catch (_) {}
 
+    // Dispatch real-time WebSocket events to update all student dashboards and profiles instantly
+    try {
+      const { broadcast, broadcastToUsers } = require('../config/socket');
+      const studentIdsList = processedRecords.map((r) => r.studentId?.toString()).filter(Boolean);
+      broadcast('attendance_updated', {
+        groupId: groupId.toString(),
+        classDate: dateOnlyStr,
+        recordsCount: processedRecords.length,
+      }, groupId.toString());
+      if (studentIdsList.length > 0) {
+        broadcastToUsers('attendance_updated', {
+          groupId: groupId.toString(),
+          classDate: dateOnlyStr,
+        }, studentIdsList);
+      }
+    } catch (_) {}
+
+    const presentCount = processedRecords.filter((r) => r.status === 'PRESENT').length;
+    const absentCount = processedRecords.filter((r) => r.status === 'ABSENT').length;
+    const leaveCount = processedRecords.filter((r) => r.status === 'LEAVE' || r.status === 'EXCUSED').length;
+    const totalCount = processedRecords.length;
+
     return successResponse(
       res,
-      { records: processedRecords, classDate: dateOnlyStr },
-      'Attendance submitted and ledger records synchronized successfully.'
+      {
+        records: processedRecords,
+        classDate: dateOnlyStr,
+        summary: {
+          presentCount,
+          absentCount,
+          leaveCount,
+          totalCount,
+          classDate: dateOnlyStr,
+          batchTitle: group.title,
+        },
+      },
+      `Attendance marked successfully: ${presentCount} Present, ${absentCount} Absent, ${leaveCount} Leave (${totalCount} total).`
     );
   } catch (err) {
     next(err);
@@ -370,7 +490,12 @@ const getGroupAttendance = async (req, res, next) => {
       }
     }
 
-    const query = { groupId };
+    const gIdStr = groupId.toString();
+    const gIdObj = mongoose.Types.ObjectId.isValid(gIdStr) ? new mongoose.Types.ObjectId(gIdStr) : null;
+    const gIdCandidates = [gIdStr];
+    if (gIdObj) gIdCandidates.push(gIdObj);
+
+    const query = { groupId: { $in: gIdCandidates } };
     if (date) {
       const parsed = new Date(date);
       if (!isNaN(parsed.getTime())) {
@@ -442,6 +567,8 @@ const getGroupAttendance = async (req, res, next) => {
       })
     );
 
+    const teacherDoc = group.teacherId ? await findTeacher(group.teacherId) : null;
+
     return successResponse(res, {
       group: {
         id: group._id.toString(),
@@ -450,8 +577,13 @@ const getGroupAttendance = async (req, res, next) => {
         code: group.code,
         subject: group.subject,
         level: group.level,
-        teacherName: group.teacherName,
+        avatar: group.avatar || group.profilePic || group.avatarUrl || '',
+        avatarUrl: group.avatar || group.profilePic || group.avatarUrl || '',
+        profilePic: group.avatar || group.profilePic || group.avatarUrl || '',
+        teacherName: group.teacherName || teacherDoc?.name || 'Teacher',
         teacherId: group.teacherId,
+        teacherAvatar: teacherDoc?.avatarUrl || '',
+        teacherAvatarUrl: teacherDoc?.avatarUrl || '',
         scheduleTime: group.scheduleTime,
         scheduleDays: group.scheduleDays,
         meetUrl: group.meetUrl,
@@ -475,20 +607,36 @@ const getMyAttendance = async (req, res, next) => {
     const sIdStr = (studentId || '').toString();
     const sIdObj = mongoose.Types.ObjectId.isValid(sIdStr) ? new mongoose.Types.ObjectId(sIdStr) : null;
 
-    // Fetch all attendance records for this student safely
+    // Fetch all attendance records for this student safely across both String and ObjectId representations
+    const candidateStudentIds = [sIdStr];
+    if (sIdObj) candidateStudentIds.push(sIdObj);
+
+    try {
+      const studentDoc = await findStudent(studentId);
+      if (studentDoc && studentDoc._id) {
+        const docIdStr = studentDoc._id.toString();
+        if (!candidateStudentIds.includes(docIdStr)) candidateStudentIds.push(docIdStr);
+        if (mongoose.Types.ObjectId.isValid(docIdStr)) {
+          const docIdObj = new mongoose.Types.ObjectId(docIdStr);
+          if (!candidateStudentIds.some((x) => typeof x === 'object' && x.toString() === docIdStr)) {
+            candidateStudentIds.push(docIdObj);
+          }
+        }
+      }
+    } catch (_) {}
+
     let records = [];
-    if (sIdObj) {
-      records = await Attendance.find({ studentId: sIdObj })
+    try {
+      records = await Attendance.find({ studentId: { $in: candidateStudentIds } })
         .populate('groupId', 'title code subject level teacherName scheduleTime scheduleDays meetUrl')
         .populate('teacherId', 'name avatarUrl phoneNumber')
         .sort({ classDate: -1 })
         .lean();
-    } else {
-      // For dev/mock IDs (e.g., dev_admin_id), query without strict ObjectId requirement
+    } catch (_) {
       try {
         const raw = await mongoose.connection.db
           .collection('attendances')
-          .find({ studentId: sIdStr })
+          .find({ studentId: { $in: candidateStudentIds } })
           .sort({ classDate: -1 })
           .toArray();
         records = raw || [];
@@ -498,12 +646,9 @@ const getMyAttendance = async (req, res, next) => {
     }
 
     // Fetch all groups where student is enrolled (handling both ObjectId and string studentIds)
-    const queryIn = [sIdStr];
-    if (sIdObj) queryIn.push(sIdObj);
-
     const enrolledGroups = await mongoose.connection.db
       .collection('groups')
-      .find({ studentIds: { $in: queryIn }, isActive: { $ne: false } })
+      .find({ studentIds: { $in: candidateStudentIds }, isActive: { $ne: false } })
       .toArray();
 
     // Map each batch with its complete attendance details
@@ -518,7 +663,7 @@ const getMyAttendance = async (req, res, next) => {
         code: g.code || '',
         subject: g.subject || '',
         level: g.level || '',
-        teacherName: g.teacherName || 'Faculty',
+        teacherName: g.teacherName || 'Teacher',
         scheduleTime: g.scheduleTime || '',
         scheduleDays: g.scheduleDays || '',
         meetUrl: g.meetUrl || '',
@@ -528,6 +673,7 @@ const getMyAttendance = async (req, res, next) => {
         presentCount: 0,
         absentCount: 0,
         excusedCount: 0,
+        leaveCount: 0,
         attendancePercentage: 0,
         records: [],
       };
@@ -544,7 +690,7 @@ const getMyAttendance = async (req, res, next) => {
           code: r.groupId.code || '',
           subject: r.groupId.subject || '',
           level: r.groupId.level || '',
-          teacherName: r.groupId.teacherName || r.teacherId?.name || 'Faculty',
+          teacherName: r.groupId.teacherName || r.teacherId?.name || 'Teacher',
           scheduleTime: r.groupId.scheduleTime || '',
           scheduleDays: r.groupId.scheduleDays || '',
           meetUrl: r.groupId.meetUrl || '',
@@ -554,6 +700,7 @@ const getMyAttendance = async (req, res, next) => {
           presentCount: 0,
           absentCount: 0,
           excusedCount: 0,
+          leaveCount: 0,
           attendancePercentage: 0,
           records: [],
         };
@@ -563,14 +710,17 @@ const getMyAttendance = async (req, res, next) => {
       b.totalClasses += 1;
       if (r.status === 'PRESENT') b.presentCount += 1;
       else if (r.status === 'ABSENT') b.absentCount += 1;
-      else if (r.status === 'EXCUSED') b.excusedCount += 1;
+      else if (r.status === 'EXCUSED' || r.status === 'LEAVE') {
+        b.excusedCount += 1;
+        b.leaveCount += 1;
+      }
       b.attendancePercentage = b.totalClasses > 0 ? Math.round((b.presentCount / b.totalClasses) * 100) : 0;
       b.records.push({
         id: r._id.toString(),
         classDate: r.classDate,
         status: r.status,
         remarks: r.remarks || '',
-        teacherName: r.teacherId?.name || r.groupId?.teacherName || 'Faculty',
+        teacherName: r.teacherId?.name || r.groupId?.teacherName || 'Teacher',
         teacherAvatar: r.teacherId?.avatarUrl || '',
         batchTitle: r.groupId?.title || b.title,
         subject: r.groupId?.subject || b.subject,
@@ -583,6 +733,7 @@ const getMyAttendance = async (req, res, next) => {
     const presentCount = records.filter((r) => r.status === 'PRESENT').length;
     const absentCount = records.filter((r) => r.status === 'ABSENT').length;
     const excusedCount = records.filter((r) => r.status === 'EXCUSED').length;
+    const leaveCount = records.filter((r) => r.status === 'LEAVE').length;
     const attendancePercentage =
       totalClasses > 0 ? Math.round((presentCount / totalClasses) * 100) : 0;
 
@@ -590,9 +741,13 @@ const getMyAttendance = async (req, res, next) => {
       summary: {
         totalClasses,
         presentCount,
+        attended: presentCount,
         absentCount,
+        absent: absentCount,
         excusedCount,
+        leaveCount,
         attendancePercentage,
+        percentage: attendancePercentage,
         enrolledBatchesCount: batches.length,
       },
       batches,
@@ -612,10 +767,19 @@ const getAdminOverview = async (req, res, next) => {
 
     const query = {};
     if (groupId && groupId !== 'ALL') {
-      query.groupId = groupId;
+      const gIdStr = groupId.toString();
+      const gIdObj = mongoose.Types.ObjectId.isValid(gIdStr) ? new mongoose.Types.ObjectId(gIdStr) : null;
+      const gIdCandidates = [gIdStr];
+      if (gIdObj) gIdCandidates.push(gIdObj);
+      query.groupId = { $in: gIdCandidates };
     }
     if (status && status !== 'ALL') {
-      query.status = status.toUpperCase();
+      const upperStatus = status.toUpperCase();
+      if (upperStatus === 'LEAVE' || upperStatus === 'EXCUSED') {
+        query.status = { $in: ['LEAVE', 'EXCUSED'] };
+      } else {
+        query.status = upperStatus;
+      }
     }
     if (date) {
       const parsed = new Date(date);
@@ -629,26 +793,41 @@ const getAdminOverview = async (req, res, next) => {
 
     const records = await Attendance.find(query)
       .populate('studentId', 'name phoneNumber email avatarUrl enrolledCreditBalance')
-      .populate('groupId', 'title code subject teacherName')
+      .populate('groupId', 'title code subject teacherName avatar avatarUrl profilePic icon')
+      .populate('teacherId', 'name avatarUrl phoneNumber')
       .populate('markedBy', 'name role')
       .sort({ classDate: -1 })
-      .limit(200);
+      .limit(1000);
 
     // Calculate aggregated metrics
     const totalRecords = records.length;
     const presentCount = records.filter((r) => r.status === 'PRESENT').length;
     const absentCount = records.filter((r) => r.status === 'ABSENT').length;
-    const excusedCount = records.filter((r) => r.status === 'EXCUSED').length;
+    const leaveCount = records.filter((r) => r.status === 'LEAVE' || r.status === 'EXCUSED').length;
+    const excusedCount = leaveCount;
     const attendanceRate = totalRecords > 0 ? Math.round((presentCount / totalRecords) * 100) : 0;
 
-    // Fetch all active batches for filter dropdown and batch cards
-    const allGroups = await Group.find({ isActive: true }).select('title code subject studentIds teacherName scheduleTime scheduleDays level meetUrl');
+    // Fetch all active batches for filter dropdown and batch cards with populated teacher & avatar
+    const rawGroups = await Group.find({ isActive: true })
+      .populate('teacherId', 'name avatarUrl phoneNumber')
+      .lean();
+
+    const allGroups = rawGroups.map((g) => ({
+      ...g,
+      id: g._id ? g._id.toString() : '',
+      avatar: g.avatar || g.profilePic || g.avatarUrl || '',
+      avatarUrl: g.avatar || g.profilePic || g.avatarUrl || '',
+      profilePic: g.avatar || g.profilePic || g.avatarUrl || '',
+      teacherAvatar: g.teacherId?.avatarUrl || '',
+      teacherAvatarUrl: g.teacherId?.avatarUrl || '',
+    }));
 
     return successResponse(res, {
       metrics: {
         totalRecords,
         presentCount,
         absentCount,
+        leaveCount,
         excusedCount,
         attendanceRate,
       },
@@ -735,9 +914,10 @@ const getTeacherHistory = async (req, res, next) => {
           presentCount: 0,
           absentCount: 0,
           excusedCount: 0,
+          leaveCount: 0,
           totalMarked: 0,
           lastMarkedAt: rec.updatedAt || rec.createdAt,
-          markedByName: rec.markedBy?.name || 'Faculty',
+          markedByName: rec.markedBy?.name || 'Teacher',
           records: [],
         });
       }
@@ -746,7 +926,10 @@ const getTeacherHistory = async (req, res, next) => {
       session.totalMarked += 1;
       if (rec.status === 'PRESENT') session.presentCount += 1;
       else if (rec.status === 'ABSENT') session.absentCount += 1;
-      else if (rec.status === 'EXCUSED') session.excusedCount += 1;
+      else if (rec.status === 'EXCUSED' || rec.status === 'LEAVE') {
+        session.excusedCount += 1;
+        session.leaveCount += 1;
+      }
 
       session.records.push({
         studentId: rec.studentId?._id || rec.studentId,

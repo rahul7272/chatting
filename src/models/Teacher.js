@@ -71,12 +71,18 @@ const TeacherSchema = new mongoose.Schema(
       default: '',
       trim: true,
     },
-    // Class Payout Rate (₹ per class/hour)
+    // Payout Model Type: Commission Percentage vs Fixed Class Rate
+    payoutType: {
+      type: String,
+      enum: ['COMMISSION', 'CLASS_RATE'],
+      default: 'COMMISSION',
+    },
+    // Class Payout Rate (₹ per class/hour) - applicable ONLY when payoutType === 'CLASS_RATE'
     hourlyOrClassRate: {
       type: Number,
-      default: 500,
+      default: 0,
     },
-    // Commission Percentage
+    // Commission Percentage - applicable ONLY when payoutType === 'COMMISSION'
     commissionPercentage: {
       type: Number,
       default: 50,

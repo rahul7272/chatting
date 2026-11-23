@@ -13,12 +13,13 @@ const SEED_TEACHERS = [
     email: 'rajendra.sharma@academy.com',
     alternativeEmail: 'pt.rajendra@gmail.com',
     instruments: ['Harmonium', 'Classical Vocal', 'Light Music / Singing'],
-    qualification: 'Sangeet Visharad (Gandharva Mahavidyalaya)',
+    qualification: 'M.Mus Vocal (Gandharva Mahavidyalaya)',
     experienceYears: 15,
     city: 'Jaipur',
     state: 'Rajasthan',
     hourlyOrClassRate: 700,
-    commissionPercentage: 60,
+    commissionPercentage: 0,
+    payoutType: 'CLASS_RATE',
     status: 'Active',
     isActive: true,
     bio: 'Senior Classical Vocal and Harmonium Guru with over 15 years of stage performance and teaching experience.',
@@ -37,7 +38,8 @@ const SEED_TEACHERS = [
     city: 'Delhi',
     state: 'Delhi',
     hourlyOrClassRate: 650,
-    commissionPercentage: 55,
+    commissionPercentage: 0,
+    payoutType: 'CLASS_RATE',
     status: 'Active',
     isActive: true,
     bio: 'Renowned Tabla exponent specializing in Delhi and Punjab gharana compositions, teentaal and accompaniment.',
@@ -55,11 +57,12 @@ const SEED_TEACHERS = [
     experienceYears: 9,
     city: 'Bengaluru',
     state: 'Karnataka',
-    hourlyOrClassRate: 600,
+    hourlyOrClassRate: 0,
     commissionPercentage: 50,
+    payoutType: 'COMMISSION',
     status: 'Active',
     isActive: true,
-    bio: 'Certified Piano and Western Vocal faculty mentoring beginner to advanced diploma students.',
+    bio: 'Certified Piano and Western Vocal teacher mentoring beginner to advanced diploma students.',
     notes: 'Handles weekend batches.',
   },
 ];
@@ -154,9 +157,11 @@ const createTeacher = async (req, res, next) => {
       state,
       hourlyOrClassRate,
       commissionPercentage,
+      payoutType = 'COMMISSION',
       status = 'Active',
       assignedBatches,
       notes,
+      joiningDate,
     } = req.body;
 
     if (!name || !name.trim()) {
@@ -176,6 +181,9 @@ const createTeacher = async (req, res, next) => {
       : [];
 
     const isTeacherActive = status === 'Active';
+    const activePayoutType = payoutType === 'CLASS_RATE' ? 'CLASS_RATE' : 'COMMISSION';
+    const finalCommission = activePayoutType === 'COMMISSION' ? (Number(commissionPercentage) || 50) : 0;
+    const finalClassRate = activePayoutType === 'CLASS_RATE' ? (Number(hourlyOrClassRate) || 500) : 0;
 
     const teacher = await Teacher.create({
       name: name.trim(),
@@ -190,11 +198,13 @@ const createTeacher = async (req, res, next) => {
       bio: bio ? bio.trim() : '',
       city: city ? city.trim() : '',
       state: state ? state.trim() : '',
-      hourlyOrClassRate: Number(hourlyOrClassRate) || 500,
-      commissionPercentage: Number(commissionPercentage) || 50,
+      hourlyOrClassRate: finalClassRate,
+      commissionPercentage: finalCommission,
+      payoutType: activePayoutType,
       status: status === 'Left' ? 'Left' : status === 'Inactive' ? 'Inactive' : 'Active',
       isActive: isTeacherActive,
       assignedBatches: parsedBatches,
+      joiningDate: joiningDate ? new Date(joiningDate) : Date.now(),
       notes: notes ? notes.trim() : '',
     });
 
@@ -225,12 +235,32 @@ const updateTeacher = async (req, res, next) => {
       updateData.experienceYears = Number(updateData.experienceYears) || 0;
     }
 
-    if (updateData.hourlyOrClassRate !== undefined) {
-      updateData.hourlyOrClassRate = Number(updateData.hourlyOrClassRate) || 500;
-    }
-
-    if (updateData.commissionPercentage !== undefined) {
-      updateData.commissionPercentage = Number(updateData.commissionPercentage) || 50;
+    if (updateData.payoutType !== undefined) {
+      updateData.payoutType = updateData.payoutType === 'CLASS_RATE' ? 'CLASS_RATE' : 'COMMISSION';
+      if (updateData.payoutType === 'COMMISSION') {
+        updateData.commissionPercentage = Number(updateData.commissionPercentage) || 50;
+        updateData.hourlyOrClassRate = 0;
+      } else {
+        updateData.hourlyOrClassRate = Number(updateData.hourlyOrClassRate) || 500;
+        updateData.commissionPercentage = 0;
+      }
+    } else {
+      // If payoutType not explicitly passed in updateData, enforce mutual exclusivity based on existing document
+      if (updateData.hourlyOrClassRate !== undefined || updateData.commissionPercentage !== undefined) {
+        const existingTeacher = await Teacher.findById(req.params.id);
+        const effectiveType = existingTeacher?.payoutType || 'COMMISSION';
+        if (effectiveType === 'COMMISSION') {
+          if (updateData.commissionPercentage !== undefined) {
+            updateData.commissionPercentage = Number(updateData.commissionPercentage) || 50;
+          }
+          updateData.hourlyOrClassRate = 0;
+        } else {
+          if (updateData.hourlyOrClassRate !== undefined) {
+            updateData.hourlyOrClassRate = Number(updateData.hourlyOrClassRate) || 500;
+          }
+          updateData.commissionPercentage = 0;
+        }
+      }
     }
 
     if (updateData.phoneNumber !== undefined) {
@@ -262,6 +292,14 @@ const updateTeacher = async (req, res, next) => {
       updateData.isActive = updateData.status === 'Active';
     } else if (updateData.isActive !== undefined) {
       updateData.status = updateData.isActive ? 'Active' : 'Left';
+    }
+
+    if (updateData.joiningDate !== undefined) {
+      if (!updateData.joiningDate) {
+        delete updateData.joiningDate;
+      } else {
+        updateData.joiningDate = new Date(updateData.joiningDate);
+      }
     }
 
     const updated = await Teacher.findByIdAndUpdate(req.params.id, updateData, {

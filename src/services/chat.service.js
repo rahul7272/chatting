@@ -952,6 +952,68 @@ class ChatService {
   }
 
   /**
+   * Bulk delete messages (Delete for Everyone or Delete for Me)
+   */
+  async bulkDeleteMessages(messageIds = [], userData = {}, forEveryone = true) {
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
+      throw new Error('messageIds array is required.');
+    }
+
+    const results = [];
+    const deletedForEveryoneIds = [];
+    let targetGroupId = null;
+
+    for (const msgId of messageIds) {
+      try {
+        const res = await this.deleteMessage(msgId, userData, forEveryone);
+        results.push(res);
+        if (res.forEveryone) {
+          deletedForEveryoneIds.push(res.messageId.toString());
+          targetGroupId = res.groupId;
+        }
+      } catch (err) {
+        logger.warn(`[bulkDeleteMessages] Failed for ${msgId}:`, err.message);
+      }
+    }
+
+    if (deletedForEveryoneIds.length > 0 && targetGroupId) {
+      try {
+        broadcast('messages_bulk_deleted', { messageIds: deletedForEveryoneIds, groupId: targetGroupId }, targetGroupId);
+      } catch (e) {
+        logger.warn('[Broadcast Error in bulkDeleteMessages]:', e.message);
+      }
+    }
+
+    return { deletedCount: results.length, details: results };
+  }
+
+  /**
+   * Bulk forward messages to target groups
+   */
+  async bulkForwardMessages(messageIds = [], targetGroupIds = [], senderContext = {}) {
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
+      throw new Error('messageIds array is required.');
+    }
+    if (!Array.isArray(targetGroupIds) || targetGroupIds.length === 0) {
+      throw new Error('targetGroupIds array is required.');
+    }
+
+    const allForwarded = [];
+    for (const msgId of messageIds) {
+      try {
+        const msgs = await this.forwardMessage(msgId, targetGroupIds, senderContext);
+        if (Array.isArray(msgs)) {
+          allForwarded.push(...msgs);
+        }
+      } catch (err) {
+        logger.warn(`[bulkForwardMessages] Failed for ${msgId}:`, err.message);
+      }
+    }
+
+    return { forwardedCount: allForwarded.length, forwardedMessages: allForwarded };
+  }
+
+  /**
    * Toggle emoji reaction on message
    */
   async toggleReaction(messageId, emoji, userData = {}) {
@@ -1007,7 +1069,7 @@ class ChatService {
     );
 
     if (!isSender && !isAdmin && !isTeacherOfGroup) {
-      throw new Error('Only faculty, admin, or message sender can pin messages in this batch.');
+      throw new Error('Only teacher, admin, or message sender can pin messages in this batch.');
     }
 
     message.isPinned = !message.isPinned;
@@ -1249,7 +1311,7 @@ class ChatService {
 
     if (forEveryone) {
       if (!isAdmin && !isTeacherOfGroup) {
-        throw new Error('Only faculty or administrators can clear group chat for everyone.');
+        throw new Error('Only teacher or administrators can clear group chat for everyone.');
       }
       await Message.deleteMany({ groupId });
       try {

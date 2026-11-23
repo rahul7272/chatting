@@ -384,7 +384,7 @@ const getMyProfile = async (req, res, next) => {
           _id: 'dev_admin_id',
           id: 'dev_admin_id',
           name: 'Development Admin',
-          email: 'admin@saptaswar.com',
+          email: 'admin@academy.com',
           role: 'ADMIN',
         },
         role: admin?.role || 'ADMIN',
@@ -432,19 +432,24 @@ const updateProfile = async (req, res, next) => {
     const accountInfo = await findAccountById(userId);
     if (accountInfo) {
       const { account } = accountInfo;
+      const isStudent = accountInfo.type === 'Student' || (req.user.role || '').toUpperCase() === ROLES.STUDENT;
+
       if (name) account.name = name.trim();
       if (resolvedAvatar !== undefined) {
         account.avatarUrl = resolvedAvatar;
         account.avatar = resolvedAvatar;
       }
-      if (phoneNumber !== undefined) {
-        account.phoneNumber = phoneNumber ? phoneNumber.trim() : undefined;
+      // Issue 43: Students cannot update registered Mobile Number or Email ID directly (Admin/Backend only)
+      if (!isStudent) {
+        if (phoneNumber !== undefined) {
+          account.phoneNumber = phoneNumber ? phoneNumber.trim() : undefined;
+        }
+        if (email && email.trim()) {
+          account.email = email.toLowerCase().trim();
+        }
       }
       if (alternativePhoneNumber !== undefined) {
         account.alternativePhoneNumber = alternativePhoneNumber ? alternativePhoneNumber.trim() : null;
-      }
-      if (email && email.trim()) {
-        account.email = email.toLowerCase().trim();
       }
       if (alternativeEmail !== undefined) {
         account.alternativeEmail = alternativeEmail ? alternativeEmail.toLowerCase().trim() : '';
@@ -510,9 +515,10 @@ const updateProfile = async (req, res, next) => {
       }
     }
 
+    const isStudentFallback = (req.user.role || '').toUpperCase() === ROLES.STUDENT;
     if (name) u.name = name.trim();
     if (resolvedAvatar !== undefined) u.avatarUrl = resolvedAvatar;
-    if (phoneNumber !== undefined) u.phoneNumber = phoneNumber ? phoneNumber.trim() : undefined;
+    if (!isStudentFallback && phoneNumber !== undefined) u.phoneNumber = phoneNumber ? phoneNumber.trim() : undefined;
     if (city !== undefined) u.city = city.trim();
     if (state !== undefined) u.state = state.trim();
     await u.save();

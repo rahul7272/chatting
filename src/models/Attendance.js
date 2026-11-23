@@ -22,6 +22,12 @@ const AttendanceSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       ref: 'Teacher',
       required: false,
+      index: true,
+    },
+    sessionTime: {
+      type: String,
+      default: '',
+      trim: true,
     },
     classDate: {
       type: Date,
@@ -30,7 +36,7 @@ const AttendanceSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['PRESENT', 'ABSENT', 'EXCUSED'],
+      enum: ['PRESENT', 'ABSENT', 'EXCUSED', 'LEAVE'],
       required: true,
     },
     creditDeducted: {

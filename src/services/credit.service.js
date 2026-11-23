@@ -3,7 +3,7 @@ const User = require('../models/User');
 const RenewalTask = require('../models/RenewalTask');
 
 class CreditService {
-  async deductCreditForClass(studentId, attendanceId) {
+  async deductCreditForClass(studentId, attendanceId, reason = 'CLASS_ATTENDANCE') {
     const student = await User.findById(studentId);
     if (!student) return;
 
@@ -15,7 +15,7 @@ class CreditService {
       studentId: student._id,
       delta: -1,
       resultingBalance: newBalance,
-      reason: 'CLASS_ATTENDANCE',
+      reason,
       referenceId: attendanceId,
     });
 

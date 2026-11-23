@@ -3,10 +3,18 @@ const router = express.Router();
 const attendanceController = require('../controllers/attendance.controller');
 const { authenticate } = require('../middleware/auth.middleware');
 const { authorize } = require('../middleware/role.middleware');
+const { idempotency } = require('../middleware/idempotency.middleware');
 const { ROLES } = require('../constants/roles');
 
 // 1. Mark or Update Attendance (Teacher restricted to last 1 day; Admin unrestricted)
-router.post('/mark', authenticate, authorize([ROLES.TEACHER, ROLES.ADMIN, ROLES.MANAGER]), attendanceController.markAttendance);
+// Protected with idempotency middleware to guarantee duplicate submission prevention (VikasBuilds State 3)
+router.post(
+  '/mark',
+  authenticate,
+  authorize([ROLES.TEACHER, ROLES.ADMIN, ROLES.MANAGER]),
+  idempotency(),
+  attendanceController.markAttendance
+);
 
 // 2. Student: View own attendance records and progress metrics
 router.get('/my-attendance', authenticate, attendanceController.getMyAttendance);

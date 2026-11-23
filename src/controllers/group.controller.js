@@ -70,7 +70,7 @@ const listGroups = async (req, res, next) => {
 
     // Search Query (title, code, subject, teacherName)
     if (search && search.trim()) {
-      const q = search.trim();
+      const q = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       filter.$or = [
         { title: { $regex: q, $options: 'i' } },
         { code: { $regex: q, $options: 'i' } },
@@ -211,6 +211,8 @@ const listGroups = async (req, res, next) => {
       total,
       page: parseInt(page),
       limit: parseInt(limit),
+      count: groupsWithMeta.length,
+      isEmpty: groupsWithMeta.length === 0,
     });
   } catch (err) {
     next(err);
@@ -466,7 +468,7 @@ const updateGroup = async (req, res, next) => {
 const assignTeacher = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { teacherId, teacherIds, teacherName, primaryTeacherId, reason = 'Faculty reallocation' } = req.body;
+    const { teacherId, teacherIds, teacherName, primaryTeacherId, reason = 'Teacher reallocation' } = req.body;
 
     const group = await Group.findById(id);
     if (!group) {
@@ -484,7 +486,7 @@ const assignTeacher = async (req, res, next) => {
       newTeacherIds = [teacherId.toString()];
     }
 
-    // Determine primary / lead faculty
+    // Determine primary / lead teacher
     let primaryId = primaryTeacherId || teacherId;
     if (!primaryId && newTeacherIds.length > 0) {
       primaryId = newTeacherIds[0];
@@ -518,7 +520,7 @@ const assignTeacher = async (req, res, next) => {
         const doc = (await Teacher.findById(tid)) || (await User.findById(tid));
         group.teacherHistory.push({
           teacherId: tid,
-          teacherName: doc?.name || 'Faculty Member',
+          teacherName: doc?.name || 'Teacher',
           assignedAt: new Date(),
           assignedBy: req.user?.name || 'Admin',
           reason,
@@ -533,7 +535,7 @@ const assignTeacher = async (req, res, next) => {
     group.activityLogs.unshift({
       action: 'Teacher Reassigned',
       actorName: req.user?.name || 'Admin',
-      details: `Faculty roster updated: ${newTeacherIds.length} instructors. Lead: "${resolvedName || 'Unassigned'}". Reason: ${reason}`,
+      details: `Teacher roster updated: ${newTeacherIds.length} instructors. Lead: "${resolvedName || 'Unassigned'}". Reason: ${reason}`,
       timestamp: new Date(),
     });
 
@@ -544,7 +546,7 @@ const assignTeacher = async (req, res, next) => {
     try {
       broadcast(socketEvents.GROUP_UPDATED, populated, id);
       if (resolvedName) {
-        chatService.sendSystemMessage(id, `🎓 Faculty allocation updated: ${resolvedName} (${reason || 'Faculty Mentor'})`, {
+        chatService.sendSystemMessage(id, `🎓 Teacher allocation updated: ${resolvedName} (${reason || 'Teacher Mentor'})`, {
           action: 'TEACHER_ASSIGNED',
           teacherId: primaryId,
           teacherIds: newTeacherIds,
@@ -558,7 +560,7 @@ const assignTeacher = async (req, res, next) => {
     return successResponse(
       res,
       { group: populated },
-      `Faculty allocated successfully (${newTeacherIds.length} teacher${newTeacherIds.length > 1 ? 's' : ''}). Lead: ${resolvedName || 'Unassigned'}.`
+      `Teacher allocated successfully (${newTeacherIds.length} teacher${newTeacherIds.length > 1 ? 's' : ''}). Lead: ${resolvedName || 'Unassigned'}.`
     );
   } catch (err) {
     next(err);
@@ -566,12 +568,12 @@ const assignTeacher = async (req, res, next) => {
 };
 
 /**
- * Add one or more Teachers to Group faculty roster
+ * Add one or more Teachers to Group teacher roster
  */
 const addTeachers = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { teacherIds = [], reason = 'Additional Faculty Mentor Allocation' } = req.body;
+    const { teacherIds = [], reason = 'Additional Teacher Mentor Allocation' } = req.body;
 
     const group = await Group.findById(id);
     if (!group) {
@@ -586,7 +588,7 @@ const addTeachers = async (req, res, next) => {
 
     if (validNewIds.length === 0) {
       const populated = await populateGroup(Group.findById(id));
-      return successResponse(res, { group: populated }, 'Selected faculty members are already assigned to this batch.');
+      return successResponse(res, { group: populated }, 'Selected teachers are already assigned to this batch.');
     }
 
     const updatedTeacherIds = [...existingIds, ...validNewIds];
@@ -604,7 +606,7 @@ const addTeachers = async (req, res, next) => {
       const doc = (await Teacher.findById(tid)) || (await User.findById(tid));
       group.teacherHistory.push({
         teacherId: tid,
-        teacherName: doc?.name || 'Faculty Member',
+        teacherName: doc?.name || 'Teacher',
         assignedAt: new Date(),
         assignedBy: req.user?.name || 'Admin',
         reason,
@@ -612,9 +614,9 @@ const addTeachers = async (req, res, next) => {
     }
 
     group.activityLogs.unshift({
-      action: 'Faculty Added',
+      action: 'Teacher Added',
       actorName: req.user?.name || 'Admin',
-      details: `${validNewIds.length} faculty member(s) added to batch.`,
+      details: `${validNewIds.length} teacher(s) added to batch.`,
       timestamp: new Date(),
     });
 
@@ -632,14 +634,14 @@ const addTeachers = async (req, res, next) => {
       console.warn('[Broadcast Error in addTeachers]:', e.message);
     }
 
-    return successResponse(res, { group: populated }, `${validNewIds.length} faculty member(s) assigned successfully.`);
+    return successResponse(res, { group: populated }, `${validNewIds.length} teacher(s) assigned successfully.`);
   } catch (err) {
     next(err);
   }
 };
 
 /**
- * Remove a specific Teacher from Group faculty roster
+ * Remove a specific Teacher from Group teacher roster
  */
 const removeTeacher = async (req, res, next) => {
   try {
@@ -663,7 +665,7 @@ const removeTeacher = async (req, res, next) => {
 
     // Resolve name of removed teacher
     const removedDoc = (await Teacher.findById(teacherId)) || (await User.findById(teacherId));
-    const removedName = removedDoc?.name || 'Faculty Member';
+    const removedName = removedDoc?.name || 'Teacher';
 
     // If removed teacher was the primary lead, promote next available or clear
     let leadChanged = false;
@@ -691,9 +693,9 @@ const removeTeacher = async (req, res, next) => {
     }
 
     group.activityLogs.unshift({
-      action: 'Faculty Removed',
+      action: 'Teacher Removed',
       actorName: req.user?.name || 'Admin',
-      details: `Teacher "${removedName}" removed from cohort. ${leadChanged ? `New lead: "${group.teacherName || 'None'}"` : ''}`,
+      details: `Teacher "${removedName}" removed from group. ${leadChanged ? `New lead: "${group.teacherName || 'None'}"` : ''}`,
       timestamp: new Date(),
     });
 
@@ -712,7 +714,7 @@ const removeTeacher = async (req, res, next) => {
       console.warn('[Broadcast Error in removeTeacher]:', e.message);
     }
 
-    return successResponse(res, { group: populated }, `Faculty member "${removedName}" unassigned successfully.`);
+    return successResponse(res, { group: populated }, `Teacher member "${removedName}" unassigned successfully.`);
   } catch (err) {
     next(err);
   }
@@ -1336,7 +1338,7 @@ const getGroupSchedules = async (req, res, next) => {
       query.subject = subject;
     }
     if (search && search.trim()) {
-      const q = search.trim();
+      const q = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       query.$and = query.$and || [];
       query.$and.push({
         $or: [
@@ -1515,7 +1517,7 @@ const getGroupSchedules = async (req, res, next) => {
         teacher: {
           _id: teacherObj._id || null,
           teacherId: teacherObj.teacherId || (teacherObj._id ? `TCH-${teacherObj._id.toString().slice(-4).toUpperCase()}` : 'TCH-104'),
-          name: teacherObj.name || group.teacherName || 'Unassigned Faculty',
+          name: teacherObj.name || group.teacherName || 'Unassigned Teacher',
           email: teacherObj.email || '',
           phoneNumber: teacherObj.phoneNumber || '',
           avatar: teacherObj.avatar || teacherObj.avatarUrl || '',
@@ -1539,7 +1541,7 @@ const getGroupSchedules = async (req, res, next) => {
     const completedCount = schedules.filter((s) => s.sessionStatus === 'COMPLETED').length;
     const attendanceMarkedCount = schedules.filter((s) => s.attendanceLogged).length;
 
-    const facultySet = new Set(schedules.map((s) => s.teacher.name).filter(Boolean));
+    const teacherSet = new Set(schedules.map((s) => s.teacher.name).filter(Boolean));
 
     return successResponse(res, {
       date: dateOnlyStr,
@@ -1551,7 +1553,7 @@ const getGroupSchedules = async (req, res, next) => {
         upcomingCount,
         completedCount,
         attendanceMarkedCount,
-        totalFacultyTeaching: facultySet.size,
+        totalTeachersTeaching: teacherSet.size,
       },
       schedules,
     });

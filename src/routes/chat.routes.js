@@ -2,9 +2,11 @@ const express = require('express');
 const router = express.Router();
 const chatController = require('../controllers/chat.controller');
 const { authenticate } = require('../middleware/auth.middleware');
+const { messageLimiter } = require('../middleware/rate_limit.middleware');
 
 // Media upload endpoints
 router.post('/upload', authenticate, chatController.uploadFile);
+router.post('/upload-stream', authenticate, chatController.uploadStream);
 router.post('/upload-multiple', authenticate, chatController.uploadMultipleFiles);
 
 // Global message search across user's enrolled batches
@@ -12,7 +14,7 @@ router.get('/search', authenticate, chatController.searchMessages);
 
 // Batch group messages & real-time actions
 router.get('/:groupId/messages', authenticate, chatController.getMessages);
-router.post('/:groupId/messages', authenticate, chatController.sendMessage);
+router.post('/:groupId/messages', authenticate, messageLimiter, chatController.sendMessage);
 router.delete('/:groupId/clear', authenticate, chatController.clearGroupChat);
 router.get('/:groupId/pinned', authenticate, chatController.getPinnedMessages);
 router.get('/:groupId/media', authenticate, chatController.getGroupMedia);
@@ -35,6 +37,8 @@ router.post('/messages/:messageId/read', authenticate, chatController.markMessag
 router.get('/messages/:messageId/read-receipts', authenticate, chatController.getMessageReadReceipts);
 
 // Message-level interactions & moderation
+router.post('/messages/bulk-delete', authenticate, chatController.bulkDeleteMessages);
+router.post('/messages/bulk-forward', authenticate, chatController.bulkForwardMessages);
 router.patch('/messages/:messageId', authenticate, chatController.editMessage);
 router.delete('/messages/:messageId', authenticate, chatController.deleteMessage);
 router.post('/messages/:messageId/react', authenticate, chatController.reactToMessage);

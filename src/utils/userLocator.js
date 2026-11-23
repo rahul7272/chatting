@@ -53,7 +53,7 @@ const findAccountById = async (id) => {
         _id: 'dev_admin_id',
         id: 'dev_admin_id',
         name: 'Development Admin',
-        email: 'admin@saptaswar.com',
+        email: 'admin@academy.com',
         role: 'ADMIN',
       },
       type: 'ADMIN',

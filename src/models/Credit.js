@@ -20,6 +20,8 @@ const CreditSchema = new mongoose.Schema(
       type: String,
       enum: [
         'CLASS_ATTENDANCE',
+        'UNEXCUSED_ABSENCE',
+        'CLASS_ABSENT',
         'TOPUP_RENEWAL',
         'ADMIN_ADJUSTMENT',
         'ATTENDANCE_REVERSAL',

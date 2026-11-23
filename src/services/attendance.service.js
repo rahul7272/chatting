@@ -17,19 +17,23 @@ class AttendanceService {
         markedBy: teacherId,
       });
 
-      if (item.status === 'PRESENT') {
-        // 1. Deduct student credit
-        await creditService.deductCreditForClass(item.studentId, attendance._id);
+      // Both PRESENT and ABSENT deduct 1 credit (-1)
+      if (item.status === 'PRESENT' || item.status === 'ABSENT') {
+        const reason = item.status === 'PRESENT' ? 'CLASS_ATTENDANCE' : 'UNEXCUSED_ABSENCE';
+        await creditService.deductCreditForClass(item.studentId, attendance._id, reason);
         attendance.creditDeducted = true;
 
-        // 2. Compute and log teacher payout
-        await payoutService.recordTeacherEarning({
-          teacherId,
-          studentId: item.studentId,
-          groupId,
-          attendanceId: attendance._id,
-        });
-        attendance.payoutCalculated = true;
+        // Teacher payout is earned ONLY for attended classes (PRESENT)
+        if (item.status === 'PRESENT') {
+          await payoutService.recordTeacherEarning({
+            teacherId,
+            studentId: item.studentId,
+            groupId,
+            attendanceId: attendance._id,
+            classDate: new Date(classDate),
+          });
+          attendance.payoutCalculated = true;
+        }
 
         await attendance.save();
       }

@@ -386,6 +386,76 @@ const uploadFile = async (req, res, next) => {
 };
 
 /**
+ * Streamed raw binary upload with byte progress tracking
+ */
+const uploadStream = async (req, res, next) => {
+  try {
+    const rawFileName = req.headers['x-file-name'] || `media_${Date.now()}`;
+    const fileName = decodeURIComponent(rawFileName);
+    const fileType = req.headers['x-file-type'] || 'application/octet-stream';
+    const category = resolveUploadCategory(fileName, fileType);
+    const safeName = `${Date.now()}_${Math.random().toString(36).substring(2, 7)}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const uploadsDir = path.join(__dirname, '../../uploads');
+    const categoryDir = path.join(uploadsDir, category);
+
+    if (!fs.existsSync(categoryDir)) {
+      fs.mkdirSync(categoryDir, { recursive: true });
+    }
+
+    const filePath = path.join(categoryDir, safeName);
+    const writeStream = fs.createWriteStream(filePath);
+    let totalBytes = 0;
+
+    req.on('data', (chunk) => {
+      totalBytes += chunk.length;
+      writeStream.write(chunk);
+    });
+
+    req.on('end', () => {
+      writeStream.end();
+      let host = req.get('host') || 'localhost:5000';
+      if (process.env.SERVER_HOST) {
+        host = process.env.SERVER_HOST.replace(/^https?:\/\//, '');
+      }
+      const protocol = req.protocol || 'http';
+      const fileUrl = `${protocol}://${host}/uploads/${category}/${safeName}`;
+
+      return successResponse(
+        res,
+        {
+          url: fileUrl,
+          category,
+          fileName: safeName,
+          fileSize: `${(totalBytes / 1024).toFixed(1)} KB`,
+          fileType,
+        },
+        'File uploaded successfully via stream.',
+        statusCodes.CREATED
+      );
+    });
+
+    req.on('error', (err) => {
+      writeStream.destroy();
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch (_) {}
+      next(err);
+    });
+
+    req.on('close', () => {
+      if (!res.writableEnded) {
+        writeStream.destroy();
+        try {
+          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        } catch (_) {}
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
  * Edit message text
  */
 const editMessage = async (req, res, next) => {
@@ -441,6 +511,51 @@ const deleteMessage = async (req, res, next) => {
 };
 
 /**
+ * Bulk delete messages (Delete for Everyone or Delete for Me)
+ */
+const bulkDeleteMessages = async (req, res, next) => {
+  try {
+    const { messageIds = [], forEveryone = true } = req.body;
+    const userData = {
+      userId: req.user?.userId,
+      name: req.user?.name,
+      role: req.user?.role || 'STUDENT',
+    };
+
+    const result = await chatService.bulkDeleteMessages(messageIds, userData, forEveryone);
+    return successResponse(res, result, 'Bulk messages deleted successfully.');
+  } catch (err) {
+    if (err.message && err.message.includes('required')) {
+      return errorResponse(res, err.message, statusCodes.BAD_REQUEST);
+    }
+    next(err);
+  }
+};
+
+/**
+ * Bulk forward messages to target groups
+ */
+const bulkForwardMessages = async (req, res, next) => {
+  try {
+    const { messageIds = [], targetGroupIds = [] } = req.body;
+    const senderContext = {
+      userId: req.user?.userId || req.body.senderId,
+      name: req.user?.name || req.body.senderName,
+      avatarUrl: req.user?.avatarUrl || req.body.avatarUrl || req.body.senderAvatar,
+      role: req.user?.role || req.body.role || 'STUDENT',
+    };
+
+    const result = await chatService.bulkForwardMessages(messageIds, targetGroupIds, senderContext);
+    return successResponse(res, result, 'Bulk messages forwarded successfully.');
+  } catch (err) {
+    if (err.message && (err.message.includes('required') || err.message.includes('disabled') || err.message.includes('restricted'))) {
+      return errorResponse(res, err.message, statusCodes.BAD_REQUEST);
+    }
+    next(err);
+  }
+};
+
+/**
  * Toggle emoji reaction on message
  */
 const reactToMessage = async (req, res, next) => {
@@ -480,7 +595,7 @@ const pinMessage = async (req, res, next) => {
     if (err.message && err.message.includes('not found')) {
       return errorResponse(res, err.message, statusCodes.NOT_FOUND);
     }
-    if (err.message && err.message.includes('faculty')) {
+    if (err.message && (err.message.includes('teacher') || err.message.includes('admin'))) {
       return errorResponse(res, err.message, statusCodes.FORBIDDEN);
     }
     next(err);
@@ -657,14 +772,17 @@ module.exports = {
   markGroupMessagesAsRead,
   getMessageReadReceipts,
   uploadFile,
+  uploadStream,
   uploadMultipleFiles,
   editMessage,
   deleteMessage,
+  bulkDeleteMessages,
   reactToMessage,
   pinMessage,
   getPinnedMessages,
   getGroupMedia,
   searchMessages,
   forwardMessage,
+  bulkForwardMessages,
   clearGroupChat,
 };

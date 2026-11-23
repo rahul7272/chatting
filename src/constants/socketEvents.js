@@ -36,4 +36,5 @@ module.exports = {
   MEMBERS_UPDATED: 'members_updated',
   SCHEDULED_MESSAGES_UPDATED: 'scheduled_messages_updated',
   SCHEDULED_MESSAGE_SENT: 'scheduled_message_sent',
+  ATTENDANCE_UPDATED: 'attendance_updated',
 };

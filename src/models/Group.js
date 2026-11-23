@@ -142,7 +142,7 @@ const GroupSchema = new mongoose.Schema(
       default: true,
       index: true,
     },
-    // Assigned Primary Lead Faculty / Teacher
+    // Assigned Primary Lead Teacher / Teacher
     teacherId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Teacher',
@@ -153,7 +153,7 @@ const GroupSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
-    // Multiple Assigned Faculty Instructors (Lead + Co-Teachers)
+    // Multiple Assigned Teachers (Lead + Co-Teachers)
     teacherIds: [
       {
         type: mongoose.Schema.Types.ObjectId,

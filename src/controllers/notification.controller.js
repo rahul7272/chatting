@@ -358,8 +358,8 @@ const seedDummyNotifications = async (req, res, next) => {
 
     const dummyNotices = [
       {
-        title: '⚡ Important: Annual Classical Sangeet Examination Schedule',
-        message: 'The annual classical music theory & practical assessments will commence from next Monday. Please download your hall tickets and verify assigned batch slots.',
+        title: '⚡ Important: Annual Examination Schedule',
+        message: 'The annual academy assessments will commence from next Monday. Please download your hall tickets and verify assigned batch slots.',
         type: 'ANNOUNCEMENT',
         priority: 'HIGH',
         targetAudience: 'STUDENTS',
@@ -412,8 +412,8 @@ const seedDummyNotifications = async (req, res, next) => {
         metadata: { alertWindow: 'T-5m', highPriorityNotification: true },
       },
       {
-        title: '📋 Faculty Notice: Monthly Student Attendance & Practice Review',
-        message: 'All teaching faculty are requested to verify student riyaaz attendance and submit credit endorsements for the upcoming evaluation week.',
+        title: '📋 Teacher Notice: Monthly Student Attendance & Practice Review',
+        message: 'All teachers are requested to verify student riyaaz attendance and submit credit endorsements for the upcoming evaluation week.',
         type: 'ANNOUNCEMENT',
         priority: 'STANDARD',
         targetAudience: 'TEACHERS',
@@ -423,11 +423,11 @@ const seedDummyNotifications = async (req, res, next) => {
         sentAt: new Date(Date.now() - 1000 * 60 * 60 * 4), // 4 hours ago
         recipientsCount: 42,
         readBy: [],
-        metadata: { category: 'FACULTY' },
+        metadata: { category: 'TEACHER' },
       },
       {
-        title: '🎉 Sangeet Mahotsav 2026: Annual Gurukul Cultural Festival',
-        message: 'We are thrilled to announce Sangeet Mahotsav 2026! Masterclass recitals by guest Maestros and solo student performances scheduled for this weekend. Entry passes available at the academic desk.',
+        title: '🎉 Annual Academy Cultural Festival 2026',
+        message: 'We are thrilled to announce Annual Academy Cultural Festival 2026! Masterclass recitals by guest speakers and solo student performances scheduled for this weekend. Entry passes available at the academic desk.',
         type: 'ANNOUNCEMENT',
         priority: 'STANDARD',
         targetAudience: 'ALL',

@@ -7,6 +7,9 @@ const fs = require('fs');
 const mongoose = require('mongoose');
 const routes = require('./routes');
 const errorHandler = require('./middleware/error.middleware');
+const { idempotency } = require('./middleware/idempotency.middleware');
+const maintenanceMiddleware = require('./middleware/maintenance.middleware');
+const { apiLimiter } = require('./middleware/rate_limit.middleware');
 const connectDB = require('./config/db');
 
 const app = express();
@@ -85,6 +88,9 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Scheduled Maintenance mode check (VikasBuilds State 23)
+app.use(maintenanceMiddleware);
+
 // Fast-fail middleware: if DB is disconnected, immediately attempt reconnect and notify client
 app.use('/api/v1', (req, res, next) => {
   if (mongoose.connection.readyState === 0) {
@@ -97,6 +103,12 @@ app.use('/api/v1', (req, res, next) => {
   }
   next();
 });
+
+// Idempotency protection for mutating endpoints (VikasBuilds State 3)
+app.use('/api/v1', idempotency());
+
+// API Rate Limiting (VikasBuilds State 29)
+app.use('/api/v1', apiLimiter);
 
 // API Routes
 app.use('/api/v1', routes);

@@ -78,12 +78,17 @@ const StudentSchema = new mongoose.Schema(
       type: [String],
       default: [],
     },
-    // Course / Admission Fee
+    // Course / Admission Fee (e.g. 800)
     fee: {
       type: Number,
-      default: 0,
+      default: 800,
     },
-    // Batch Name / Cohort
+    // Total classes enrolled in package (e.g. 8)
+    packageClasses: {
+      type: Number,
+      default: 8,
+    },
+    // Batch Name / Group
     batchName: {
       type: String,
       default: '',

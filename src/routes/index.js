@@ -12,6 +12,10 @@ const courseRoutes = require('./course.routes');
 const locationRoutes = require('./location.routes');
 const adminRoutes = require('./admin.routes');
 const notificationRoutes = require('./notification.routes');
+const uploadRoutes = require('./upload.routes');
+const appRoutes = require('./app.routes');
+const syncRoutes = require('./sync.routes');
+const payoutRoutes = require('./payout.routes');
 
 router.use('/auth', authRoutes);
 router.use('/users', userRoutes);
@@ -23,7 +27,11 @@ router.use('/groups', groupRoutes);
 router.use('/chat', chatRoutes);
 router.use('/attendance', attendanceRoutes);
 router.use('/credits', creditRoutes);
+router.use('/payouts', payoutRoutes);
 router.use('/admin', adminRoutes);
 router.use('/notifications', notificationRoutes);
+router.use('/upload', uploadRoutes);
+router.use('/app', appRoutes);
+router.use('/sync', syncRoutes);
 
 module.exports = router;

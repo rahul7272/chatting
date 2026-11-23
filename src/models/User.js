@@ -115,6 +115,11 @@ const UserSchema = new mongoose.Schema(
       default: 0,
     },
     // Relevant for teachers
+    payoutType: {
+      type: String,
+      enum: ['COMMISSION', 'CLASS_RATE'],
+      default: 'COMMISSION',
+    },
     hourlyOrClassRate: {
       type: Number,
       default: 0,
