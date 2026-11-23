@@ -11,6 +11,10 @@ const createLimiter = (options = {}) => {
     max: options.max || 60, // Limit each IP to 60 requests per window
     standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
     legacyHeaders: true, // Return `X-RateLimit-*` headers
+    validate: {
+      xForwardedForHeader: false,
+      ...(options.validate || {}),
+    },
     handler: (req, res) => {
       const retryAfter = Math.ceil((options.windowMs || 60000) / 1000);
       res.setHeader('Retry-After', retryAfter);

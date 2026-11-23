@@ -14,6 +14,9 @@ const connectDB = require('./config/db');
 
 const app = express();
 
+// Trust reverse proxy (Nginx, Cloudflare, etc.) to accurately determine client IP and prevent ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+app.set('trust proxy', 1);
+
 // Ensure uploads directory and subdirectories exist
 const uploadsDir = path.join(__dirname, '../uploads');
 const uploadSubdirs = ['documents', 'images', 'audio', 'videos'];
