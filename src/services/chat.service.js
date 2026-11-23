@@ -417,6 +417,30 @@ class ChatService {
       ];
     }
 
+    // Guard: Prevent saving local device paths (e.g. Android cache /data/user/ or file://)
+    const isLocalDevicePath = (u) => {
+      if (!u || typeof u !== 'string') return false;
+      const s = u.trim();
+      return (
+        s.startsWith('/data/user/') ||
+        s.startsWith('/storage/') ||
+        s.startsWith('file://') ||
+        s.startsWith('/var/mobile/') ||
+        s.includes('file_picker')
+      );
+    };
+
+    if (['VIDEO', 'DOCUMENT', 'IMAGE', 'VOICE'].includes(type)) {
+      const anyLocal = cleanAttachments.some((a) => isLocalDevicePath(a.url)) ||
+        isLocalDevicePath(metadata.fileUrl) ||
+        isLocalDevicePath(metadata.videoUrl) ||
+        isLocalDevicePath(metadata.imageUrl) ||
+        isLocalDevicePath(metadata.audioUrl);
+      if (anyLocal) {
+        throw new Error('Local device paths cannot be stored as attachment URLs. Please ensure the file is uploaded to the server first.');
+      }
+    }
+
     if (!metadata.fileUrl && cleanAttachments.length > 0 && cleanAttachments[0].url) {
       metadata.fileUrl = cleanAttachments[0].url;
     }

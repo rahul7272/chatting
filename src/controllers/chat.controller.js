@@ -329,7 +329,7 @@ const saveFileBuffer = (fileData, fileName = `media_${Date.now()}.jpg`, fileType
   if (process.env.SERVER_HOST) {
     host = process.env.SERVER_HOST.replace(/^https?:\/\//, '');
   }
-  const protocol = req.protocol || 'http';
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
   const fileUrl = `${protocol}://${host}/uploads/${category}/${safeName}`;
 
   return {
@@ -413,11 +413,17 @@ const uploadStream = async (req, res, next) => {
 
     req.on('end', () => {
       writeStream.end();
+      if (totalBytes <= 0) {
+        try {
+          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        } catch (_) {}
+        return errorResponse(res, 'Uploaded file is empty (0 bytes received).', statusCodes.BAD_REQUEST);
+      }
       let host = req.get('host') || 'localhost:5000';
       if (process.env.SERVER_HOST) {
         host = process.env.SERVER_HOST.replace(/^https?:\/\//, '');
       }
-      const protocol = req.protocol || 'http';
+      const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
       const fileUrl = `${protocol}://${host}/uploads/${category}/${safeName}`;
 
       return successResponse(
