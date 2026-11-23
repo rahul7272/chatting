@@ -3,6 +3,9 @@ const Credit = require('../models/Credit');
 const User = require('../models/User');
 const Student = require('../models/Student');
 const RenewalTask = require('../models/RenewalTask');
+const Attendance = require('../models/Attendance');
+const Group = require('../models/Group');
+const Teacher = require('../models/Teacher');
 const { successResponse, errorResponse } = require('../utils/response');
 const statusCodes = require('../constants/statusCodes');
 
@@ -17,14 +20,88 @@ const findStudent = async (id) => {
 const getStudentCredits = async (req, res, next) => {
   try {
     const studentId = req.params.studentId || req.user.userId;
-    const [history, student] = await Promise.all([
-      Credit.find({ studentId }).sort({ createdAt: -1 }),
-      findStudent(studentId),
-    ]);
+    const student = await findStudent(studentId);
 
     if (!student) {
       return errorResponse(res, 'Student not found.', statusCodes.NOT_FOUND);
     }
+
+    const targetIds = [student._id];
+    if (studentId && !targetIds.some(id => id.toString() === studentId.toString())) {
+      targetIds.push(studentId);
+    }
+    try {
+      if (student.phone) {
+        const alt = student.constructor.modelName === 'Student'
+          ? await User.findOne({ phone: student.phone }).select('_id')
+          : await Student.findOne({ phone: student.phone }).select('_id');
+        if (alt && !targetIds.some(id => id.toString() === alt._id.toString())) {
+          targetIds.push(alt._id);
+        }
+      }
+    } catch (_) {}
+
+    const rawHistory = await Credit.find({ studentId: { $in: targetIds } })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Collect all valid Attendance reference IDs
+    const attendanceIds = rawHistory
+      .map(h => h.referenceId)
+      .filter(id => id && mongoose.Types.ObjectId.isValid(id));
+
+    const attendanceMap = {};
+    if (attendanceIds.length > 0) {
+      const attendances = await Attendance.find({ _id: { $in: attendanceIds } })
+        .populate('groupId', 'title code subject')
+        .populate('teacherId', 'name')
+        .lean();
+
+      // Check for teachers stored in User model as fallback
+      const unresolvedTeacherIds = [];
+      for (const att of attendances) {
+        if (att.teacherId && (!att.teacherId.name || typeof att.teacherId === 'string')) {
+          unresolvedTeacherIds.push(att.teacherId._id || att.teacherId);
+        }
+      }
+
+      let userTeacherMap = {};
+      if (unresolvedTeacherIds.length > 0) {
+        const users = await User.find({ _id: { $in: unresolvedTeacherIds } }).select('name').lean();
+        for (const u of users) {
+          userTeacherMap[u._id.toString()] = u.name;
+        }
+      }
+
+      for (const att of attendances) {
+        let tName = '';
+        if (att.teacherId && typeof att.teacherId === 'object' && att.teacherId.name) {
+          tName = att.teacherId.name;
+        } else if (att.teacherId) {
+          const tIdStr = (att.teacherId._id || att.teacherId).toString();
+          tName = userTeacherMap[tIdStr] || '';
+        }
+
+        const grp = att.groupId && typeof att.groupId === 'object' ? att.groupId : {};
+        attendanceMap[att._id.toString()] = {
+          batchName: grp.title || grp.name || '',
+          subject: grp.subject || '',
+          batchCode: grp.code || '',
+          teacherName: tName,
+          sessionTime: att.sessionTime || '',
+          classDate: att.classDate || null,
+          status: att.status || '',
+        };
+      }
+    }
+
+    const history = rawHistory.map(item => {
+      const classDetails = item.referenceId ? attendanceMap[item.referenceId.toString()] || null : null;
+      return {
+        ...item,
+        classDetails,
+      };
+    });
 
     return successResponse(res, {
       studentId: student._id,
